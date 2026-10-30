@@ -45,6 +45,27 @@ Run it with the same `DATA_DIR` (or `TEACHERS_FILE`) as the server. Passwords ar
 locked out for 1 hour. Behind a reverse proxy, set `CLIENT_IP_HEADER` (see below) or every visitor shares the proxy's
 address and one student's wrong guesses would lock everyone out.
 
+## Classrooms, profiles and the AI-writing scan (teachers)
+- **Classrooms:** make a class in the Staff room and it gets a code (like `SCI-7K3Q`). When you hand in a student's
+  paper, pick the class and type the student's name or number. Students don't log in; profiles come from what
+  teachers hand in.
+- **Class page:** class average, papers, and per student: papers, average, latest score with trend, reading level
+  and AI-scan flags. **Student page:** every paper with score, words, reading level and AI-scan result.
+- **What to do with a paper:** mark it, mark it and scan for AI writing, AI scan only (fast, no web research), or
+  teacher draft help.
+- **AI-writing scan:** signals, not a verdict. It looks at sentence rhythm, stock AI phrases, personal voice,
+  paragraph sizes, the local model's read (with quoted passages), and, the most useful one, how much the paper differs
+  from the same student's earlier papers in that class. Result: few / some / strong signs, each reason shown.
+  **No AI detector is reliable** (they often wrongly flag English learners and formal writing), so use it to start a
+  conversation, never as proof.
+
+## Uploads and photos
+The hand-in form takes a Word file (.docx), a PDF, a text file, or a photo or scan of handwritten work. Text from
+Word, text and PDF files goes straight into the box to check before handing in. Photos and scanned PDFs are read by a
+local vision model (`OCR_MODEL`, default `qwen3-vl:4b-instruct` via Ollama) as the first step of marking, about a
+minute a page on a CPU, and the report notes that it was read from a photo. PDFs need `pdftotext`/`pdftoppm`
+(poppler-utils); Pillow (`python3-pil`) is optional and makes big phone photos much faster to read.
+
 ## Requirements
 - Python 3.10+ (standard library only, nothing to `pip install`)
 - [Ollama](https://ollama.com) with a model that follows instructions well. Tested with `glm-4.7-flash:q4_K_M`
@@ -58,6 +79,7 @@ address and one student's wrong guesses would lock everyone out.
 git clone https://github.com/ThatJeffGuy/homework-wizard
 cd homework-wizard
 ollama pull glm-4.7-flash:q4_K_M
+ollama pull qwen3-vl:4b-instruct          # only needed for photos and scans
 DATA_DIR=./data/jobs python3 homework_wizard.py     # then open http://localhost:8501
 DATA_DIR=./data/jobs python3 add_teacher.py
 ```
@@ -73,6 +95,8 @@ Settings (environment variables):
 | `TEACHERS_FILE` | `teachers.json` next to `DATA_DIR` | teacher logins (hashed passwords) |
 | `SECRET_FILE` | `secret.key` next to `DATA_DIR` | signs teacher logins (created automatically) |
 | `CLIENT_IP_HEADER` | none | header holding the visitor's real address, set by your proxy, e.g. `CF-Connecting-IP` (Cloudflare) or `X-Real-IP` (nginx with `proxy_set_header X-Real-IP $remote_addr`). Only set it if every request goes through that proxy, since visitors could fake it otherwise |
+| `OCR_MODEL` | `qwen3-vl:4b-instruct` | Ollama vision model that reads photos and scans |
+| `OCR_URL` | same as `LLM_URL` | Ollama endpoint for the vision model |
 | `PORT` | `8501` | web port |
 | `THREADS` | Ollama's choice | CPU threads for the model (on CPU-only setups, roughly your physical core count) |
 

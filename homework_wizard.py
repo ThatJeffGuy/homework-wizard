@@ -13,7 +13,8 @@ Pipeline per job (each step is saved to state.json, so a restart resumes where i
   sections -> claims -> research (SearXNG + page fetch) -> verdicts -> topic ideas -> tips -> done
 The student's text is never rewritten.
 """
-import hashlib, hmac, html, json, os, re, secrets, sys, threading, time, traceback, urllib.parse, urllib.request
+import base64, email.parser, email.policy, hashlib, hmac, html, io, json, os, re, secrets, subprocess, sys, tempfile, threading, time
+import traceback, urllib.parse, urllib.request, zipfile
 from http.cookies import SimpleCookie
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,7 +28,6 @@ THREADS = int(os.environ.get("THREADS", "0"))  # CPU threads for the model; 0 = 
 WPM = 238
 UA = "Mozilla/5.0 (X11; Linux x86_64) HomeworkWizard/1.0"
 REPO = "https://github.com/ThatJeffGuy/homework-wizard"
-STEPS = ["sections", "claims", "research", "verdicts", "newsections", "additions", "done"]
 
 wake = threading.Event()
 _base = os.path.dirname(os.path.abspath(DATA))
@@ -36,6 +36,7 @@ SECRET_FILE = os.environ.get("SECRET_FILE", os.path.join(_base, "secret.key"))  
 SESSION_DAYS = 30
 STUDENTS_FILE = os.path.join(_base, "students.json")   # hint balance per browser
 SETTINGS_FILE = os.path.join(_base, "settings.json")   # teacher-adjustable settings
+CLASSES_FILE = os.path.join(_base, "classes.json")     # classrooms: code -> name, teacher
 
 
 # ---------- storage ----------
@@ -320,15 +321,24 @@ def step_additions(st):
 def is_student(st):
     return st.get("mode", "student") == "student"
 
+def steps_for(st):
+    """The steps this job runs: photos/scans are read first; "scan" jobs only run the AI-writing scan."""
+    pre = ["ocr"] if st.get("ocr_files") else []
+    if st.get("mode") == "scan":
+        return pre + ["sections", "aiscan", "done"]
+    return pre + ["sections", "claims", "research", "verdicts", "newsections", "additions"] + (["aiscan"] if st.get("aiscan") else []) + ["done"]
+
 def run_job(jid):
     st = load(jid)
     st.setdefault("started", time.time())
     try:
         while st["step"] != "done":
             st["status"] = "running"; log(st, "step: " + st["step"])
-            {"sections": step_sections, "claims": step_claims, "research": step_research, "verdicts": step_verdicts,
-             "newsections": step_newsections, "additions": step_additions}[st["step"]](st)
-            st["step"] = STEPS[STEPS.index(st["step"]) + 1]; save(st)
+            {"ocr": step_ocr, "sections": step_sections, "claims": step_claims, "research": step_research,
+             "verdicts": step_verdicts, "newsections": step_newsections, "additions": step_additions,
+             "aiscan": step_aiscan}[st["step"]](st)
+            steps = steps_for(st)
+            st["step"] = steps[steps.index(st["step"]) + 1]; save(st)
         award_hint(st)
         st["status"] = "done"; st["finished"] = time.time()
         log(st, f"finished in {round((st['finished'] - st['created']) / 60)} min")
@@ -509,7 +519,7 @@ def score(st):
 def award_hint(st):
     """A marked student paper scoring at least the teacher's threshold earns one hint (once per paper)."""
     pct, need = score(st), settings()["hint_score"]
-    if not is_student(st) or not st.get("owner") or pct is None or st.get("hint_award"):
+    if not is_student(st) or not st.get("owner") or st.get("by_teacher") or pct is None or st.get("hint_award"):
         return
     if pct >= need:
         before = hints_left(st["owner"])
@@ -545,6 +555,344 @@ def make_hint(jid, hid):
         st = load(jid)
         st["hints"][hid].update(answer=text, status=status, evidence=ev)
         save(st)
+
+
+# ---------- uploads: Word, PDF, text files, and photos/scans read by a local vision model ----------
+OCR_MODEL = os.environ.get("OCR_MODEL", "qwen3-vl:4b-instruct")
+OCR_URL = os.environ.get("OCR_URL", LLM_URL)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+MAX_UPLOAD = 20 * 1024 * 1024
+MAX_PAGES = 10
+OCR_PROMPT = ("Transcribe all the writing in this image exactly as written, including handwriting. Keep the paragraphs "
+              "and put each heading on its own line. Do not fix spelling or grammar, do not add anything and do not "
+              "describe the image. If a word cannot be read, write [?]. Output only the text.")
+
+def docx_text(data):
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        xml = z.read("word/document.xml").decode("utf-8", "replace")
+    paras = []
+    for p in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S):
+        t = html.unescape("".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)</w:t>", p))).strip()
+        if t:
+            paras.append(t)
+    return "\n\n".join(paras)
+
+def pdf_text(data):
+    """Text layer of a PDF, or None if pdftotext (poppler-utils) is not installed."""
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.pdf")
+        with open(src, "wb") as f:
+            f.write(data)
+        try:
+            out = subprocess.run(["pdftotext", "-enc", "UTF-8", src, "-"], capture_output=True, timeout=60).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return re.sub(r"[ \t]+\n", "\n", out.decode("utf-8", "replace")).replace("\f", "\n\n").strip()
+
+def pdf_pages(data):
+    """A scanned PDF (no text layer) as PNG pages for OCR; needs pdftoppm."""
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.pdf")
+        with open(src, "wb") as f:
+            f.write(data)
+        subprocess.run(["pdftoppm", "-r", "150", "-png", "-l", str(MAX_PAGES), src, os.path.join(d, "p")],
+                       capture_output=True, timeout=180, check=True)
+        out = []
+        for n in sorted(os.listdir(d)):
+            if n.endswith(".png"):
+                with open(os.path.join(d, n), "rb") as f:
+                    out.append(f.read())
+        return out
+
+def extract(filename, data):
+    """-> (text or None, list of images to OCR). Raises ValueError with a message for the user."""
+    name = filename.lower()
+    if name.endswith((".txt", ".md")):
+        return data.decode("utf-8", "replace"), []
+    if name.endswith(".docx"):
+        try:
+            return docx_text(data), []
+        except (zipfile.BadZipFile, KeyError):
+            raise ValueError("That Word file could not be opened (only .docx works, not the old .doc).")
+    if name.endswith(".pdf"):
+        text = pdf_text(data)
+        if text is None:
+            raise ValueError("Reading PDFs needs pdftotext on the server (the poppler-utils package).")
+        if words(text) >= 30:
+            return text, []
+        try:
+            return None, pdf_pages(data)
+        except (OSError, subprocess.SubprocessError):
+            raise ValueError("This PDF has no text in it and could not be turned into images to read.")
+    if name.endswith(IMAGE_EXT):
+        return None, [data]
+    raise ValueError("Upload a Word file (.docx), a PDF, a text file, or a photo or scan (.jpg, .png).")
+
+def shrink(img):
+    """Big phone photos make OCR very slow on a CPU; scale to 1600 px if Pillow is installed."""
+    try:
+        from PIL import Image, ImageOps
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(img))).convert("RGB")
+        im.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=90)
+        return buf.getvalue()
+    except Exception:
+        return img
+
+def ocr_image(img):
+    body = {"model": OCR_MODEL, "stream": False, "think": False, "options": {"temperature": 0, "num_predict": 3000},
+            "messages": [{"role": "user", "content": OCR_PROMPT, "images": [base64.b64encode(shrink(img)).decode()]}]}
+    if THREADS:
+        body["options"]["num_thread"] = THREADS
+    req = urllib.request.Request(OCR_URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=3600) as r:
+        return json.load(r)["message"]["content"].strip()
+
+def step_ocr(st):
+    files, pages = st.get("ocr_files", []), st.setdefault("ocr_pages", {})
+    for n, name in enumerate(files, 1):
+        if name not in pages:
+            with open(jpath(st["id"], name), "rb") as f:
+                pages[name] = ocr_image(f.read())
+            log(st, f"read page {n} of {len(files)} from the photo/scan")
+    text = "\n\n".join(pages[n] for n in files).strip()
+    if not text:
+        raise ValueError("No writing could be read from the photo or scan.")
+    st["text"] = ((st.get("typed") or "") + "\n\n" + text).strip()[:60000]
+
+def parse_body(handler):
+    """-> (fields, files) for url-encoded or multipart forms; files = {name: (filename, bytes)}."""
+    n = int(handler.headers.get("Content-Length", 0))
+    if n > MAX_UPLOAD + 200_000:
+        raise ValueError("That file is too big (20 MB max).")
+    raw = handler.rfile.read(n)
+    ctype = handler.headers.get("Content-Type", "")
+    if not ctype.startswith("multipart/form-data"):
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True).items()}, {}
+    msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
+    fields, files = {}, {}
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        data = part.get_payload(decode=True) or b""
+        if part.get_filename() is not None:
+            if data:
+                files[name] = (part.get_filename(), data)
+        else:
+            fields[name] = data.decode("utf-8", "replace")
+    return fields, files
+
+
+# ---------- writing statistics + AI-writing scan (signals for teachers, never proof) ----------
+AI_PHRASES = ["delve", "it's important to note", "it is important to note", "it is worth noting", "plays a crucial role",
+              "a crucial role", "a pivotal role", "in today's fast-paced", "in today's world", "tapestry", "a testament to",
+              "navigate the complexities", "navigating the", "a myriad of", "underscore", "multifaceted", "intricate",
+              "the realm of", "the landscape of", "foster", "embark", "showcasing", "seamless", "ever-evolving",
+              "shed light on", "serves as a", "in summary", "in conclusion", "furthermore", "moreover", "additionally",
+              "ultimately", "notably", "paramount", "comprehensive", "harness", "leverage", "vibrant", "robust",
+              "a rich history", "stands as", "unlock the", "dive into", "let's explore"]
+
+def syllables(w):
+    w = re.sub(r"[^a-z]", "", w.lower())
+    if len(w) <= 3:
+        return 1
+    w = re.sub(r"^y", "", re.sub(r"(?:[^laeiouy]es|ed|[^laeiouy]e)$", "", w))
+    return max(1, len(re.findall(r"[aeiouy]{1,2}", w)))
+
+def spread(xs):
+    """Coefficient of variation: how uneven a list of lengths is (0 = all the same)."""
+    if len(xs) < 2 or not sum(xs):
+        return None
+    mean = sum(xs) / len(xs)
+    return (sum((x - mean) ** 2 for x in xs) / len(xs)) ** .5 / mean
+
+def text_stats(text):
+    wre = r"[A-Za-z0-9'’-]+"
+    ws = re.findall(wre, text)
+    sents = [s for s in re.split(r"(?<=[.!?])\s+", text) if re.search(r"[A-Za-z]", s)]
+    paras = [p for p in re.split(r"\n\s*\n", text) if len(re.findall(wre, p)) > 12]
+    n, ns = max(1, len(ws)), max(1, len(sents))
+    return {"words": len(ws), "sentences": len(sents),
+            "grade": round(0.39 * n / ns + 11.8 * sum(syllables(w) for w in ws) / n - 15.59, 1),
+            "avg_sentence": round(n / ns, 1), "sent_spread": spread([len(re.findall(wre, s)) for s in sents]),
+            "para_spread": spread([len(re.findall(wre, p)) for p in paras]) if len(paras) >= 4 else None,
+            "word_len": round(sum(len(w) for w in ws) / n, 2),
+            "contractions": 1000 * sum(1 for w in ws if re.search(r"[a-z][’'](?:s|t|re|ve|ll|d|m)$", w.lower())) / n,
+            "first_person": 1000 * sum(1 for w in ws if w.lower() in ("i", "me", "my", "mine", "we", "our", "us")) / n}
+
+def earlier_papers(st):
+    if not st.get("student_key"):
+        return []
+    return [j for j in all_jobs() if j.get("classroom") == st.get("classroom") and j.get("student_key") == st["student_key"]
+            and j["id"] != st["id"] and j["status"] == "done" and j["created"] < st["created"] and j.get("text")]
+
+def ai_scan(st):
+    text, s = st["text"], text_stats(st["text"])
+    signals = []
+    add = lambda name, value, flag, note: signals.append({"name": name, "value": value, "flag": flag, "note": note})
+    if s["sentences"] >= 8 and s["sent_spread"] is not None:
+        v = s["sent_spread"]
+        add("Sentence rhythm", f"{v:.2f}", 2 if v < .35 else 1 if v < .45 else 0,
+            "How much sentence lengths vary. People usually mix short and long sentences (about 0.5 or more); "
+            "very even sentences are common in AI writing.")
+    else:
+        add("Sentence rhythm", "too short to tell", 0, "Needs at least 8 sentences.")
+    low = text.lower().replace("’", "'")
+    hits = [(p, low.count(p)) for p in AI_PHRASES if p in low]
+    rate = 1000 * sum(c for _, c in hits) / max(1, s["words"])
+    add("Stock AI phrases", f"{rate:.1f} per 1,000 words" + (": " + ", ".join(f"“{p}”" + (f" ×{c}" if c > 1 else "") for p, c in hits[:8]) if hits else ""),
+        2 if rate >= 4 else 1 if rate >= 2 else 0,
+        "Phrases AI tools lean on heavily. Students use them too, so only a high rate means much.")
+    add("Personal voice", f"{s['contractions']:.1f} contractions and {s['first_person']:.1f} first-person words per 1,000 words",
+        1 if s["contractions"] < 1.5 and s["first_person"] < 3 else 0,
+        "AI writing tends to be impersonal, with few contractions (don't, it's) or I/we. Formal assignments are often like this too.")
+    if s["para_spread"] is not None:
+        add("Paragraph sizes", f"{s['para_spread']:.2f}", 1 if s["para_spread"] < .25 else 0,
+            "Paragraphs that are all almost the same length can be a sign of generated text.")
+    prev = earlier_papers(st)
+    if len(prev) >= 2:
+        ps = [text_stats(j["text"]) for j in prev]
+        g = sum(p["grade"] for p in ps) / len(ps); wl = sum(p["word_len"] for p in ps) / len(ps)
+        jump, wjump = s["grade"] - g, s["word_len"] - wl
+        add("Change from their own earlier work", f"reading level {s['grade']} vs usual {g:.1f}; word length {s['word_len']} vs usual {wl:.2f}",
+            2 if jump >= 3 or wjump >= .5 else 1 if jump >= 2 or wjump >= .3 else 0,
+            f"Compared with this student's {len(prev)} earlier papers in this class. A sudden jump is the most useful signal here.")
+    else:
+        add("Change from their own earlier work", "not enough earlier papers yet", 0,
+            "Needs 2 earlier papers from this student in this class. Hand in their work with a class and name to build this up.")
+    try:
+        r = llm([{"role": "system", "content": "You help a teacher look for signs that a piece of student writing was "
+                  "produced by an AI tool. Be cautious and fair: many students write formally, and English learners are "
+                  "often wrongly accused. Only point to concrete signs and quote them exactly."},
+                 {"role": "user", "content": "Read this student writing. How strong are the signs that it was generated by AI "
+                  "rather than written by a student? Consider generic statements with no personal detail, overly polished "
+                  "and uniform style, stock phrases, lists of three, summary-style conclusions, and facts with no specifics. "
+                  'Reply as JSON: {"level":"low|some|strong","signs":[{"quote":"exact words from the text","why":"short reason"}]} '
+                  "with at most 4 signs.\n\nWRITING:\n" + text[:12000]}], as_json=True, temp=0.1, max_tokens=700)
+        lvl = str(r.get("level", "low")).lower()
+        signs = [x for x in (r.get("signs") or []) if isinstance(x, dict) and len(str(x.get("quote", ""))) > 8
+                 and norm(str(x["quote"])) in norm(text)][:4]
+        model = {"level": lvl if lvl in ("low", "some", "strong") else "low", "signs": signs}
+    except Exception as ex:
+        model = {"level": "low", "signs": [], "error": ex.__class__.__name__}
+    add("Model's read", model["level"], {"strong": 2, "some": 1}.get(model["level"], 0),
+        "The local model's own opinion. Models are poor judges of this, so it counts for little on its own.")
+    points = sum(x["flag"] for x in signals)
+    return {"level": "strong" if points >= 6 else "some" if points >= 3 else "low", "points": points,
+            "signals": signals, "signs": model["signs"], "stats": s}
+
+def step_aiscan(st):
+    st["ai"] = ai_scan(st)
+    log(st, f"AI-writing scan: {st['ai']['level']} ({st['ai']['points']} points)")
+
+AI_LEVEL = {"low": ("supported", "Few signs of AI writing"), "some": ("partly", "Some signs of AI writing"),
+            "strong": ("contradicted", "Strong signs of AI writing")}
+
+def ai_card(st):
+    a = st.get("ai")
+    if not a:
+        return ""
+    cls, label = AI_LEVEL[a["level"]]
+    rows = "".join(f"<li><span class='v {('contradicted' if x['flag'] == 2 else 'partly' if x['flag'] else 'supported')}'>"
+                   f"{'●●' if x['flag'] == 2 else '●○' if x['flag'] else '○○'}</span><b>{e(x['name'])}:</b> {e(x['value'])}"
+                   f"<br><span class=mut>{e(x['note'])}</span></li>" for x in a["signals"])
+    signs = "".join(f"<li><q>{e(x['quote'])}</q> <span class=mut>— {e(x.get('why'))}</span></li>" for x in a.get("signs", []))
+    return (f"<details class='card aiscan' open><summary><b>AI-writing scan</b> <span class='v {cls}'>{label}</span></summary>"
+            "<p class=mut><b>This is not proof.</b> AI detectors, this one included, are often wrong, especially with "
+            "English learners and formal or formulaic writing. Treat it as a reason to talk with the student and compare "
+            "with their other work, never as evidence on its own.</p>"
+            f"<ul class=claims>{rows}</ul>" + (f"<p><b>Passages the model pointed at:</b></p><ul>{signs}</ul>" if signs else "")
+            + "</details>")
+
+
+# ---------- classrooms + student profiles (teachers hand in work with a class and a student name/number) ----------
+CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+def all_classes():
+    return read_json(CLASSES_FILE, {})
+
+def classes_for(teacher):
+    return {c: v for c, v in all_classes().items() if v.get("teacher") == teacher}
+
+def create_class(teacher, name):
+    with file_lock:
+        classes = all_classes()
+        prefix = (re.sub(r"[^A-Z]", "", name.upper()) + "CLS")[:3]
+        while True:
+            code = prefix + "-" + "".join(secrets.choice(CODE_CHARS) for _ in range(4))
+            if code not in classes:
+                break
+        classes[code] = {"name": name.strip()[:80] or code, "teacher": teacher, "created": time.strftime("%Y-%m-%d")}
+        write_json(CLASSES_FILE, classes)
+    return code
+
+def student_key(name):
+    return " ".join(name.lower().split())[:80]
+
+def paper_row(j):
+    sc = score(j)
+    s = text_stats(j["text"]) if j.get("text") else {}
+    ai = (j.get("ai") or {}).get("level")
+    ai_cell = "<span class='v %s'>%s</span>" % (AI_LEVEL[ai][0], ai) if ai else "–"
+    return ("<tr><td class=mut>%s</td><td><a href='/job/%s'>%s</a></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            % (time.strftime("%Y-%m-%d", time.localtime(j["created"])), j["id"], e(j["title"]), STATUS.get(j["status"], e(j["status"])),
+               "%s%%" % sc if sc is not None else "–", s.get("words", "–"), s.get("grade", "–"), ai_cell))
+
+def avg(xs):
+    xs = [x for x in xs if x is not None]
+    return round(sum(xs) / len(xs)) if xs else None
+
+def class_page(code, teacher, viewer):
+    c = classes_for(teacher).get(code)
+    if not c:
+        return None
+    jobs = [j for j in all_jobs() if j.get("classroom") == code]
+    marked = [j for j in jobs if j["status"] == "done"]
+    people = {}
+    for j in sorted(jobs, key=lambda j: j["created"]):
+        people.setdefault(j["student_key"], {"name": j.get("student", j["student_key"]), "jobs": []})["jobs"].append(j)
+    rows = ""
+    for key, p in sorted(people.items()):
+        done = [j for j in p["jobs"] if j["status"] == "done"]
+        scores = [score(j) for j in done if score(j) is not None]
+        trend = "" if len(scores) < 2 else ("▲" if scores[-1] > scores[-2] else "▼" if scores[-1] < scores[-2] else "=")
+        flags = sum(1 for j in done if (j.get("ai") or {}).get("level") in ("some", "strong"))
+        last_grade = text_stats(done[-1]["text"])["grade"] if done else "–"
+        rows += (f"<tr><td><a href='/class/{code}/s/{urllib.parse.quote(key)}'>{e(p['name'])}</a></td><td>{len(p['jobs'])}</td>"
+                 f"<td>{f'{avg(scores)}%' if scores else '–'}</td><td>{f'{scores[-1]}% {trend}' if scores else '–'}</td>"
+                 f"<td>{last_grade}</td><td>{flags or ''}</td></tr>")
+    ca = avg([score(j) for j in marked])
+    body = (f"<p><a href='/'>← Back to the pile</a></p><h1>{e(c['name'])}</h1>"
+            f"<p>Class code <b class=hand style='font-size:1.3rem'>{code}</b></p>"
+            f"<div class=stats><span>{len(people)} students</span><span>{len(jobs)} papers</span>"
+            f"<span>Class average: {f'{ca}%' if ca is not None else '–'}</span>"
+            f"<span>Avg reading level: {avg([text_stats(j['text'])['grade'] for j in marked if j.get('text')]) or '–'}</span></div>"
+            "<h2>Students</h2><div style=overflow-x:auto><table><tr class=mut><td>Student</td><td>Papers</td><td>Average</td>"
+            f"<td>Latest</td><td>Reading level</td><td>AI flags</td></tr>{rows or '<tr><td class=mut colspan=6>No papers yet. Hand in work with this class picked.</td></tr>'}</table></div>"
+            "<p class=mut>Scores are the share of checked claims that held up. AI flags count papers with some or strong signs; "
+            "open the paper to see why, and remember they are not proof.</p>")
+    return page(c["name"], body, side=drawers(teacher, viewer))
+
+def student_page(code, key, teacher, viewer):
+    c = classes_for(teacher).get(code)
+    jobs = [j for j in all_jobs() if j.get("classroom") == code and j.get("student_key") == key] if c else []
+    if not jobs:
+        return None
+    jobs.sort(key=lambda j: j["created"])
+    done = [j for j in jobs if j["status"] == "done"]
+    mine, cls = avg([score(j) for j in done]), avg([score(j) for j in all_jobs() if j.get("classroom") == code and j["status"] == "done"])
+    body = (f"<p><a href='/class/{code}'>← {e(c['name'])}</a></p><h1>{e(jobs[-1].get('student', key))}</h1>"
+            f"<div class=stats><span>{len(jobs)} papers</span><span>Average: {f'{mine}%' if mine is not None else '–'}</span>"
+            f"<span>Class average: {f'{cls}%' if cls is not None else '–'}</span>"
+            f"<span>Avg reading level: {avg([text_stats(j['text'])['grade'] for j in done if j.get('text')]) or '–'}</span></div>"
+            "<div style=overflow-x:auto><table><tr class=mut><td>Date</td><td>Paper</td><td>Status</td><td>Score</td><td>Words</td>"
+            f"<td>Reading level</td><td>AI scan</td></tr>{''.join(paper_row(j) for j in reversed(jobs))}</table></div>"
+            "<p class=mut>The AI scan compares each paper with this student's earlier ones, so it gets more useful as their "
+            "papers build up here.</p>")
+    return page(jobs[-1].get("student", key), body, side=drawers(teacher, viewer))
 
 # ---------- web ----------
 CSS = """
@@ -671,6 +1019,8 @@ button.side-tab.left{left:0;transform:translateY(-50%);border-radius:0 12px 12px
 .checks label{display:flex;gap:8px;align-items:flex-start;color:var(--ink);font-size:.93rem}.checks input{width:auto;margin-top:5px}
 .timer{font:700 2.4rem/1.1 ui-monospace,monospace;text-align:center;margin:6px 0}
 .cv{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+label.upload{display:block;margin:.2em 0}label.upload input{margin-top:6px;background:transparent;border-style:dashed}
+.aiscan{border-left:4px solid var(--half)}.aiscan summary .v{margin-left:.6em}
 .star{color:var(--pencil-edge);font-size:1.2rem;letter-spacing:.1em}.star.off{color:var(--line)}
 .hintbox{background:var(--paper)}.hintbox p{margin:.3em 0}
 #hintbar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:40;display:none;max-width:92vw;
@@ -848,17 +1198,23 @@ def teacher_panel(teacher, viewer, open_it=False, msg=""):
                 "autocomplete=current-password required></label><p><button>Log in</button></p></form>"
                 "<p class=mut>No login yet? Your school adds teachers on the server with <code>add_teacher.py</code>.</p>")
     else:
-        mine = [s for s in all_jobs() if not is_student(s) and (s.get("owner") == viewer or not s.get("owner"))]
+        mine = [s for s in all_jobs() if s.get("by_teacher") == teacher or (not is_student(s) and (s.get("owner") == viewer or not s.get("owner")))]
+        cls = "".join(f"<li><a href='/class/{c}'>{e(v['name'])}</a> <span class=mut>· {c}</span></li>"
+                      for c, v in sorted(classes_for(teacher).items(), key=lambda x: x[1]["name"]))
         rows = "".join(f"<li><a href='/job/{s['id']}'>{e(s['title'])}</a> <span class=mut>· {STATUS.get(s['status'], e(s['status']))}"
                        f"{f' {progress(s)[0]}%' if s['status'] == 'running' else ''}</span></li>" for s in mine[:20])
         body = (f"<h2>Staff room</h2><p>Logged in as <b>{e(teacher)}</b></p>"
                 "<form method=post action=/teacher/logout><button>Log out</button></form>"
+                f"<h3 style='margin-top:1.2em'>Classrooms</h3><ul>{cls or '<li class=mut>None yet.</li>'}</ul>"
+                "<form method=post action=/teacher/class class=row><input name=name placeholder='New class name' required>"
+                "<button>Make class</button></form>"
                 f"<h3 style='margin-top:1.2em'>Your teacher work</h3><ul>{rows or '<li class=mut>None yet.</li>'}</ul>"
                 f"<h3>Student hints</h3><form method=post action=/teacher/settings class=card>"
                 f"<label class=mut>Score needed to earn a hint (%)<input name=hint_score type=number min=0 max=100 value={settings()['hint_score']}></label>"
                 f"<label class=mut>Hints a new student starts with (0-{MAX_HINTS})<input name=start_hints type=number min=0 max={MAX_HINTS} value={settings()['start_hints']}></label>"
                 "<p><button>Save</button></p></form>"
-                "<h3>How teacher mode works</h3><ul class=mut><li>Pick <b>Teacher</b> in the form before handing in.</li>"
+                "<h3>How teacher mode works</h3><ul class=mut><li>Pick what to do in the form: mark it, mark it and scan for "
+                "AI writing, scan only, or teacher draft help. Pick a class and type the student's name or number to build their profile.</li>"
                 "<li>You get sourced additions and new sections as tick-box suggestions, then <b>Write out the clean copy</b>.</li>"
                 "<li>Students never see teacher mode, and teacher work only opens while you are logged in.</li>"
                 "<li>Logins last 30 days on this device. 3 wrong passwords lock that address out for 1 hour.</li></ul>")
@@ -869,11 +1225,24 @@ def teacher_panel(teacher, viewer, open_it=False, msg=""):
 def drawers(teacher, viewer, open_staff=False, msg=""):
     return student_panel(viewer, teacher) + teacher_panel(teacher, viewer, open_staff, msg) + DRAWER_JS
 
+TASK = {("student", False): "marking", ("student", True): "marking + AI scan", ("scan", False): "AI scan",
+        ("teacher", False): "teacher draft"}
+UPLOAD_JS = """<script>
+(()=>{const f=document.querySelector('#handin input[type=file]'),ta=document.querySelector('#handin textarea'),note=document.getElementById('upnote');
+document.getElementById('handin').addEventListener('submit',ev=>{if(!ta.value.trim()&&!f.files.length){ev.preventDefault();note.textContent='Paste your draft or pick a file first.'}});
+f.addEventListener('change',async()=>{if(!f.files.length)return;note.textContent='Reading the file…';const fd=new FormData();fd.append('file',f.files[0]);
+ try{const r=await(await fetch('/extract',{method:'POST',body:fd})).json();
+  if(r.error){note.textContent=r.error;f.value=''}
+  else if(r.ocr){note.textContent='This is a photo or scan ('+r.pages+' page'+(r.pages>1?'s':'')+'). It will be read when marking starts (about a minute a page), and the report will say so. Check the text there for reading mistakes.'}
+  else{ta.value=r.text;f.value='';note.textContent='Text taken from the file. Have a quick look, then hand it in.';if(!document.querySelector('#handin input[name=title]').value)document.querySelector('#handin input[name=title]').value=r.title||''}}
+ catch(e){note.textContent='Could not read the file here; it will be read when you hand it in.'}})})();
+</script>"""
 STATUS = {"queued": "In the pile", "running": "Being marked…", "done": "Marked ✓", "error": "Lost in the backpack"}
 MARKS = {"supported": "✓ checks out", "partly": "½ partly right", "unclear": "? needs a source", "contradicted": "✗ check this"}
 
 # step -> (share of the total time, what the student sees)
-PHASES = {"sections": (0.01, "Reading your draft"), "claims": (0.06, "Finding the claims to check"),
+PHASES = {"ocr": (0.12, "Reading the photo or scan"), "aiscan": (0.06, "Scanning for signs of AI writing"),
+          "sections": (0.01, "Reading your draft"), "claims": (0.06, "Finding the claims to check"),
           "research": (0.12, "Looking up sources"), "verdicts": (0.45, "Checking claims against sources"),
           "newsections": (0.18, "Looking for extra topic ideas"), "additions": (0.18, "Writing the teacher's notes")}
 
@@ -882,19 +1251,22 @@ def progress(st):
     secs = st.get("sections", [])
     claims = [c for x in secs for c in x.get("claims", [])]
     step, done_share = st["step"], 0.0
-    for name, (share, _) in PHASES.items():
+    steps = [x for x in steps_for(st) if x in PHASES]
+    whole = sum(PHASES[x][0] for x in steps) or 1
+    for name in steps:
         if name == step:
             break
-        done_share += share
+        done_share += PHASES[name][0]
     part = {"claims": lambda: (sum("claims" in x for x in secs), len(secs)),
             "research": lambda: (sum("evidence" in c for c in claims), len(claims)),
             "verdicts": lambda: (sum("verdict" in c for c in claims), len(claims)),
             "newsections": lambda: (sum(("tips" in x or "draft" in x) for x in st.get("new", [])), len(st.get("new", [])) or 1),
-            "additions": lambda: (sum("additions" in x for x in secs), len(secs))}.get(step, lambda: (0, 1))()
+            "additions": lambda: (sum("additions" in x for x in secs), len(secs)),
+            "ocr": lambda: (len(st.get("ocr_pages", {})), len(st.get("ocr_files", [])))}.get(step, lambda: (0, 1))()
     n, total = part
     share, label = PHASES.get(step, (0, step))
-    pct = min(99, int(100 * (done_share + share * (n / total if total else 0))))
-    return pct, f"{label}" + (f": {n} of {total}" if step in ("research", "verdicts") and total else "")
+    pct = min(99, int(100 * (done_share + share * (n / total if total else 0)) / whole))
+    return pct, f"{label}" + (f": {n} of {total}" if step in ("research", "verdicts", "ocr") and total else "")
 
 def progress_bar(st):
     if st["status"] == "queued":
@@ -915,22 +1287,37 @@ def queue_place(st):
 def home(viewer, teacher, msg="", staff_msg=""):
     mine = [s for s in all_jobs() if s.get("owner") == viewer or (teacher and not s.get("owner"))]
     rows = "".join(
-        f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{'teacher' if not is_student(s) else 'student'}</td>"
+        f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{TASK.get((s.get('mode'), bool(s.get('aiscan'))), 'student')}"
+        f"{' · ' + e(s['student']) if s.get('student') else ''}</td>"
         f"<td>{STATUS.get(s['status'], e(s['status']))}{f' {progress(s)[0]}%' if s['status'] == 'running' else ''}</td>"
         f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created']))}</td></tr>" for s in mine)
-    mode_pick = ("<select name=mode><option value=teacher>Teacher: draft sourced additions</option>"
-                 "<option value=student>Student: check and coach</option></select>") if teacher else ""
+    mode_pick, teacher_row = "", ""
+    if teacher:
+        mode_pick = ("<select name=task><option value=mark>Mark it (student feedback)</option>"
+                     "<option value=markscan>Mark it + scan for AI writing</option>"
+                     "<option value=scan>Scan for AI writing only (fast)</option>"
+                     "<option value=teacher>Teacher draft help (sourced additions)</option></select>")
+        mine_cls = classes_for(teacher)
+        names = sorted({j.get("student", "") for j in all_jobs() if j.get("classroom") in mine_cls and j.get("student")})
+        teacher_row = ("<div class=row><select name=classroom><option value=''>No class</option>"
+                       + "".join(f"<option value={c}>{e(v['name'])} ({c})</option>" for c, v in sorted(mine_cls.items(), key=lambda x: x[1]["name"]))
+                       + "</select><input name=student list=students placeholder='Student name or number' autocomplete=off>"
+                       + "<datalist id=students>" + "".join(f"<option value='{e(n)}'>" for n in names) + "</datalist></div>"
+                       + ("" if mine_cls else "<p class=mut>Make a class in the Staff room to build student profiles.</p>"))
     return page("Homework Wizard", f"""<h1>{HAT}<span class=hl>Homework Wizard</span></h1>
 <div class=motto>It checks your homework. It doesn't do it for you.</div>
 <p class=mut>Hand in your own draft. Every claim gets checked against real sources, and your work comes back marked:
 what checks out, what to fix, and notes on how to make it stronger, with the sources to read. Marking takes
 20-60 minutes and papers are marked one at a time, so you can close this page and come back.</p>
 {f"<div class='card add'><b class=hand>Note:</b> {e(msg)}</div>" if msg else ""}
-<form method=post action=/new class=card>
+<form method=post action=/new class=card enctype=multipart/form-data id=handin>
 <div class=row><input name=title placeholder="Title of your assignment" required>
 <label class=num>Extra topic ideas <input name=extra type=number min=0 max=6 value=3></label>{mode_pick}</div>
-<p><textarea name=text placeholder="Paste your draft here. Put each heading on its own line." required></textarea></p>
-<p><button>✏️ Hand it in</button></p></form>
+{teacher_row}
+<p><textarea name=text placeholder="Paste your draft here. Put each heading on its own line."></textarea></p>
+<label class="upload mut">…or upload it: Word (.docx), PDF, text file, or a photo of handwritten work
+<input type=file name=file accept=".docx,.pdf,.txt,.md,image/*"></label><p class=mut id=upnote></p>
+<p><button>✏️ Hand it in</button></p></form>{UPLOAD_JS}
 <h2>Your homework pile</h2><table>{rows or '<tr><td class=mut>Nothing handed in yet (only work handed in from this browser shows here).</td></tr>'}</table>
 """, side=drawers(teacher, viewer, bool(staff_msg), staff_msg))
 
@@ -972,6 +1359,16 @@ def report(st, viewer=None, teacher=None):
             f"<span>Original: {orig_words} words · {read_min(orig_words)} min</span>"
             + ("" if student else f"<span>With selected: <span id=nw>{orig_words}</span> words · <span id=nm>{read_min(orig_words)}</span> min</span>")
             + "</div>")
+    if teacher and st.get("classroom"):
+        c = all_classes().get(st["classroom"], {})
+        head += (f"<p class=mut>Class <a href='/class/{st['classroom']}'>{e(c.get('name', st['classroom']))}</a> · student "
+                 f"<a href='/class/{st['classroom']}/s/{urllib.parse.quote(st.get('student_key', ''))}'>{e(st.get('student'))}</a></p>")
+    if st.get("ocr_files") and st["status"] == "done":
+        head += "<p class=mut>This paper was read from a photo or scan. If something looks wrong, it may be a reading mistake.</p>"
+    if teacher:
+        head += ai_card(st)
+    elif st.get("mode") == "scan":
+        return page("Not found", "<p>Not found. <a href='/'>Home</a></p>")
     award = st.get("hint_award")
     if award and st.get("owner") == viewer:
         head += (f"<div class='card add'><b class=hand>{'Nice work!' if award['earned'] else 'Marked.'}</b> You scored {award['score']}%"
@@ -1095,6 +1492,12 @@ class H(BaseHTTPRequestHandler):
         p = self.path.split("?")[0]
         if p == "/":
             return self.send(200, home(vid, teacher))
+        m = re.match(r"^/class/([A-Z]{3}-[A-Z0-9]{4})(?:/s/(.+))?$", p)
+        if m and teacher:
+            out = (student_page(m.group(1), urllib.parse.unquote(m.group(2)), teacher, vid) if m.group(2)
+                   else class_page(m.group(1), teacher, vid))
+            if out:
+                return self.send(200, out)
         m = re.match(r"^/job/([0-9a-f]+)(\.json)?$", p)
         st = self.job(m.group(1), teacher) if m else None
         if st:
@@ -1103,9 +1506,25 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         vid, teacher = self.who()
-        n = min(int(self.headers.get("Content-Length", 0)), 400_000)
-        form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
-        f = lambda k, d="": form.get(k, [d])[0]
+        try:
+            fields, files = parse_body(self)
+        except ValueError as ex:
+            self.close_connection = True
+            return self.send(413, home(vid, teacher, str(ex)))
+        f = lambda k, d="": fields.get(k, d)
+        if self.path == "/extract":
+            try:
+                if "file" not in files:
+                    raise ValueError("No file was received.")
+                name, data = files["file"]
+                text, images = extract(name, data)
+                out = {"ocr": True, "pages": len(images)} if images else {"text": text.strip(), "title": os.path.splitext(os.path.basename(name))[0][:120]}
+            except ValueError as ex:
+                out = {"error": str(ex)}
+            return self.send(200, json.dumps(out), "application/json")
+        if self.path == "/teacher/class" and teacher:
+            code = create_class(teacher, f("name"))
+            return self.send(303, "", loc=f"/class/{code}")
         if self.path == "/teacher":
             ip = (self.headers.get(IP_HEADER, "") if IP_HEADER else "").strip() or self.client_address[0]
             if lock_left(ip):
@@ -1150,10 +1569,21 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/teacher/logout":
             return self.send(303, "", loc="/", cookies=["hw_teacher=; Path=/; Max-Age=0"])
         if self.path == "/new":
-            text = f("text").replace("\r\n", "\n").strip()
-            if not text:
-                return self.send(400, home(vid, teacher, "Paste your draft first."))
-            mode = "teacher" if teacher and f("mode") == "teacher" else "student"
+            text, images = f("text").replace("\r\n", "\n").strip(), []
+            if "file" in files:
+                try:
+                    got, images = extract(*files["file"])
+                except ValueError as ex:
+                    return self.send(400, home(vid, teacher, str(ex)))
+                text = text or (got or "").strip()
+            if not text and not images:
+                return self.send(400, home(vid, teacher, "Paste your draft or pick a file first."))
+            task = f("task") if teacher else "mark"
+            mode = {"mark": "student", "markscan": "student", "scan": "scan", "teacher": "teacher"}.get(task, "student")
+            classroom = f("classroom") if teacher and f("classroom") in classes_for(teacher) else ""
+            student = " ".join(f("student").split())[:80] if classroom else ""
+            if classroom and not student:
+                return self.send(400, home(vid, teacher, "Type the student's name or number when you pick a class."))
             if not teacher and any(s.get("owner") == vid and s["status"] in ("queued", "running") for s in all_jobs()):
                 return self.send(429, home(vid, teacher, "You already have a job waiting or running. Please wait for it to finish."))
             jid = secrets.token_hex(16)
@@ -1163,7 +1593,18 @@ class H(BaseHTTPRequestHandler):
             except ValueError:
                 extra = 3
             st = {"id": jid, "title": f("title", "Untitled")[:200] or "Untitled", "text": text[:60000], "created": time.time(),
-                  "extra": extra, "status": "queued", "step": "sections", "mode": mode, "owner": vid}
+                  "extra": extra, "status": "queued", "step": "sections", "mode": mode, "owner": vid, "aiscan": task == "markscan"}
+            if teacher:
+                st["by_teacher"] = teacher
+            if classroom:
+                st.update(classroom=classroom, student=student, student_key=student_key(student))
+            if images:
+                st["ocr_files"], st["typed"], st["step"] = [], text, "ocr"
+                for i, img in enumerate(images[:MAX_PAGES], 1):
+                    name = f"page-{i:02d}.img"
+                    with open(jpath(jid, name), "wb") as fh:
+                        fh.write(img)
+                    st["ocr_files"].append(name)
             save(st); wake.set()
             return self.send(303, "", loc=f"/job/{jid}")
         m = re.match(r"^/retry/([0-9a-f]+)$", self.path)
