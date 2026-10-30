@@ -460,28 +460,56 @@ def session_teacher(cookie):
 
 # ---------- web ----------
 CSS = """
-:root{--bg:#f7f6f2;--fg:#1d1d1b;--mut:#6b6a64;--card:#fff;--line:#e2e0d8;--acc:#2f6f5e;
---sup:#2e7d32;--par:#b7791f;--unc:#6b6a64;--con:#c0392b;--add:#e9f4ee;--new:#eef1fb}
-@media (prefers-color-scheme:dark){:root{--bg:#161614;--fg:#ecebe6;--mut:#9c9a92;--card:#1f1f1c;--line:#34332e;
---acc:#6fc2a8;--add:#1d2b25;--new:#1d2130}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,sans-serif}
-.wrap{max-width:860px;margin:0 auto;padding:24px 16px 80px}h1{font-size:1.6rem;margin:.2em 0}
-h2{font-size:1.25rem;margin:2em 0 .4em;padding-top:.6em;border-top:1px solid var(--line)}
-.mut{color:var(--mut);font-size:.9rem}a{color:var(--acc)}
-textarea,input,select{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
-textarea{min-height:340px}button{font:inherit;padding:9px 18px;border:0;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer}
-button.link{background:none;color:var(--acc);padding:0;text-decoration:underline}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:10px 0}
-.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.row>*{flex:1 1 160px}
-.v{display:inline-block;font-size:.75rem;font-weight:600;text-transform:uppercase;padding:1px 8px;border-radius:99px;color:#fff;margin-right:6px}
-.supported{background:var(--sup)}.partly{background:var(--par)}.unclear{background:var(--unc)}.contradicted{background:var(--con)}
-.claims{font-size:.92rem}.claims li{margin:.5em 0}.add{background:var(--add)}.newsec{background:var(--new)}
-.add label,.newsec label{font-weight:600;font-size:.85rem;display:flex;gap:8px;align-items:center;cursor:pointer}
+:root{--paper:#fdfcf6;--ink:#1f2a44;--mut:#5b6377;--rule:#d6e4f2;--margin:#f0a8a8;--card:#fff;--line:#d9dce3;
+--acc:#1d58b0;--pen:#c62828;--ok:#2e7d32;--half:#b86e00;--q:#5b6377;--bad:#c62828;
+--sticky:#fff4a3;--sticky-ink:#3b3410;--sticky2:#d9f5c9;--pencil:#ffcd3c;--pencil-edge:#c99700;--hl:#fff27a;
+--hand:"Segoe Print","Bradley Hand","Chalkboard SE","Marker Felt","Comic Neue","Patrick Hand","Comic Sans MS",system-ui,sans-serif}
+@media (prefers-color-scheme:dark){:root{--paper:#21342b;--ink:#eef2ea;--mut:#b5c2b8;--rule:rgba(255,255,255,.05);
+--margin:rgba(255,140,140,.35);--card:#2b4136;--line:#3f5a4c;--acc:#9fd0ff;--pen:#ff8f85;--ok:#a5e8a1;--half:#ffcf86;
+--q:#cfd8d2;--bad:#ff8f85;--sticky:#e9dc78;--sticky2:#bfe3ad;--hl:rgba(255,242,122,.25)}}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);font:16px/1.65 system-ui,sans-serif;background:var(--paper)
+ repeating-linear-gradient(transparent 0 31px,var(--rule) 31px 32px)}
+.wrap{position:relative;max-width:880px;min-height:100vh;margin:0 auto;padding:28px 18px 80px 46px}
+h1 svg{width:1.15em;height:1.15em;vertical-align:-.12em;margin-right:.15em}
+.wrap::before{content:"";position:absolute;top:0;bottom:0;left:30px;border-left:2px solid var(--margin)}
+h1,h2,h3,summary b,.hand{font-family:var(--hand)}
+h1{font-size:2.1rem;margin:.1em 0;line-height:1.2}
+h1 .hl{background:linear-gradient(transparent 58%,var(--hl) 58% 92%,transparent 92%)}
+h2{font-size:1.4rem;margin:2em 0 .4em}
+.motto{font-family:var(--hand);font-size:1.15rem;color:var(--pen);transform:rotate(-1deg);display:inline-block;margin:.2em 0 .6em}
+.mut{color:var(--mut);font-size:.92rem}a{color:var(--acc)}
+textarea,input,select{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)}
+textarea{min-height:340px;line-height:26px;padding:12px 12px;background:var(--card)
+ repeating-linear-gradient(transparent 0 25px,var(--rule) 25px 26px);background-position:0 12px;background-attachment:local}
+label.num{display:flex;align-items:center;gap:8px;font-size:.92rem;color:var(--mut)}label.num input{width:5em}
+button{font:700 1rem system-ui,sans-serif;padding:9px 20px;border:0;border-radius:4px 16px 16px 4px;background:var(--pencil);
+ color:#2b2100;box-shadow:0 3px 0 var(--pencil-edge);cursor:pointer}
+button:active{transform:translateY(2px);box-shadow:0 1px 0 var(--pencil-edge)}
+button.link{background:none;box-shadow:none;color:var(--acc);padding:0;text-decoration:underline;font-weight:400;border-radius:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 16px;margin:12px 0;box-shadow:1px 2px 0 rgba(0,0,0,.06)}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.row>*{flex:1 1 170px}
+.v{display:inline-block;font:700 .9rem var(--hand);padding:0 .45em;border:2px solid currentColor;border-radius:7px;
+ margin:0 .5em .2em 0;transform:rotate(-3deg);white-space:nowrap}
+.supported{color:var(--ok)}.partly{color:var(--half)}.unclear,.pending{color:var(--q)}.contradicted{color:var(--bad)}
+.claims{font-size:.93rem}.claims ul{padding-left:1.1em}.claims li{margin:.7em 0;list-style:none}
+.add{background:var(--sticky);color:var(--sticky-ink);border:0;border-radius:2px;transform:rotate(-.5deg);
+ box-shadow:2px 4px 8px rgba(0,0,0,.15);margin:14px 6px}
+.add:nth-of-type(even){transform:rotate(.6deg)}.add.pickable{background:var(--sticky2)}.add a{color:#1a4f9c}
+.add .mut{color:#6b6230}.add b.hand{font-size:1.05rem}
+.newsec{border-radius:3px;padding-top:8px}
+.newsec>b:first-child,.newsec>label{display:block;border-bottom:2px solid var(--margin);padding-bottom:.35em;margin-bottom:.5em;font-family:var(--hand)}
+.add label,.newsec label{font-weight:700;display:flex;gap:8px;align-items:center;cursor:pointer}.add label input,.newsec label input{width:auto}
 .src{font-size:.82rem}.src a{word-break:break-all}.orig p{margin:.7em 0}
-pre{white-space:pre-wrap;font:13px/1.45 ui-monospace,monospace;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:260px;overflow:auto}
+.score{display:inline-block;font:700 1.35rem var(--hand);color:var(--pen);border:3px solid var(--pen);border-radius:50%;
+ padding:.35em 1em;transform:rotate(-4deg);margin:.4em 0 .2em}
+pre{white-space:pre-wrap;font:13px/1.45 ui-monospace,monospace;background:var(--card);border:1px dashed var(--line);border-radius:4px;padding:10px;max-height:260px;overflow:auto}
 footer{margin-top:48px;padding-top:12px;border-top:1px solid var(--line);color:var(--mut);font-size:.85rem;text-align:center}
-.stats{display:flex;gap:18px;flex-wrap:wrap;font-weight:600}table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-bottom:1px solid var(--line)}
-details.teacher{margin-top:28px}details.teacher form{display:flex;gap:10px;flex-wrap:wrap}details.teacher input{flex:1 1 220px;width:auto}
+.stats{display:flex;gap:6px 22px;flex-wrap:wrap;font-weight:600;align-items:center}
+table{width:100%;border-collapse:collapse}td{padding:7px 4px;border-bottom:1px solid var(--rule)}
+details.teacher{margin-top:32px}details.teacher form{display:flex;gap:10px;flex-wrap:wrap}details.teacher input{flex:1 1 220px;width:auto}
+summary{cursor:pointer}
+@media (max-width:520px){.wrap{padding-left:30px}.wrap::before{left:16px}h1{font-size:1.7rem}}
 """
 
 FOOTER = (f"<footer><b>Made by <a href='https://www.everydaysciencestuff.com' target=_blank rel=noopener>That Scottish Guy</a></b>"
@@ -506,6 +534,13 @@ def cite_links(text, ev):
         return "[" + ",".join(out) + "]"
     return re.sub(r"\[\d+(?:\s*,\s*\d+)*\]", sub, t)
 
+HAT = ("<svg viewBox='0 0 64 64' aria-hidden=true><path d='M6 52Q32 43 58 52Q32 61 6 52Z' fill='currentColor'/>"
+       "<path d='M14 50L33 7Q37 3 38 9L47 49Q30 44 14 50Z' fill='currentColor'/>"
+       "<path d='M27 27l2.2 4.4 4.8.7-3.5 3.4.8 4.8-4.3-2.3-4.3 2.3.8-4.8-3.5-3.4 4.8-.7z' fill='#ffcd3c'/>"
+       "<circle cx='38' cy='19' r='2.2' fill='#ffcd3c'/><circle cx='22' cy='44' r='1.6' fill='#ffcd3c'/></svg>")
+STATUS = {"queued": "In the pile", "running": "Being marked…", "done": "Marked ✓", "error": "Lost in the backpack"}
+MARKS = {"supported": "✓ checks out", "partly": "½ partly right", "unclear": "? needs a source", "contradicted": "✗ check this"}
+
 def queue_place(st):
     if st["status"] != "queued":
         return 0
@@ -515,29 +550,30 @@ def home(viewer, teacher, msg=""):
     mine = [s for s in all_jobs() if s.get("owner") == viewer or (teacher and not s.get("owner"))]
     rows = "".join(
         f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{'teacher' if not is_student(s) else 'student'}</td>"
-        f"<td>{e(s['status'])}{' · ' + e(s['step']) if s['status'] == 'running' else ''}</td>"
+        f"<td>{STATUS.get(s['status'], e(s['status']))}</td>"
         f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created']))}</td></tr>" for s in mine)
     mode_pick = ("<select name=mode><option value=teacher>Teacher: draft sourced additions</option>"
                  "<option value=student>Student: check and coach</option></select>") if teacher else ""
     if teacher:
-        who = (f"<p class=mut>Logged in as teacher: <b>{e(teacher)}</b> · <form method=post action=/teacher/logout "
+        who = (f"<p class=mut>In the staff room as <b>{e(teacher)}</b> · <form method=post action=/teacher/logout "
                f"style=display:inline><button class=link>log out</button></form></p>")
     else:
-        who = ("<details class=teacher><summary class=mut>Teacher login</summary>"
+        who = ("<details class=teacher><summary class=mut>Staff room (teacher login)</summary>"
                "<form method=post action=/teacher class=card><input name=email type=email autocomplete=username "
                "placeholder='Email' required><input name=password type=password autocomplete=current-password "
                "placeholder='Password' required><button>Log in</button></form></details>")
-    return page("Homework Wizard", f"""<h1>Homework Wizard</h1>
-<p class=mut>Paste your own draft. A local model checks every claim against web sources and tells you what
-holds up, what to fix and what could make it stronger, with the sources to read. It checks your work; it does not
-write it. A full piece can take 20-60 minutes, and jobs run one at a time; you can close this page and come back.</p>
-{f"<div class=card><b>{e(msg)}</b></div>" if msg else ""}
+    return page("Homework Wizard", f"""<h1>{HAT}<span class=hl>Homework Wizard</span></h1>
+<div class=motto>It checks your homework. It doesn't do it for you.</div>
+<p class=mut>Hand in your own draft. Every claim gets checked against real sources, and your work comes back marked:
+what checks out, what to fix, and notes on how to make it stronger, with the sources to read. Marking takes
+20-60 minutes and papers are marked one at a time, so you can close this page and come back.</p>
+{f"<div class='card add'><b class=hand>Note:</b> {e(msg)}</div>" if msg else ""}
 <form method=post action=/new class=card>
-<div class=row><input name=title placeholder="Title" required><input name=extra type=number min=0 max=6 value=3 title="Extra topics">{mode_pick}</div>
-<p class=mut>Number box = how many extra topics to suggest.</p>
-<textarea name=text placeholder="Paste your draft here. Put headings on their own line." required></textarea>
-<p><button>Start</button></p></form>
-<h2>Your jobs</h2><table>{rows or '<tr><td class=mut>None yet (only jobs started from this browser are listed).</td></tr>'}</table>
+<div class=row><input name=title placeholder="Title of your assignment" required>
+<label class=num>Extra topic ideas <input name=extra type=number min=0 max=6 value=3></label>{mode_pick}</div>
+<p><textarea name=text placeholder="Paste your draft here. Put each heading on its own line." required></textarea></p>
+<p><button>✏️ Hand it in</button></p></form>
+<h2>Your homework pile</h2><table>{rows or '<tr><td class=mut>Nothing handed in yet (only work handed in from this browser shows here).</td></tr>'}</table>
 {who}""")
 
 TEACHER_SCRIPT = """<script>
@@ -565,14 +601,18 @@ def report(st):
     student = is_student(st)
     orig_words = words(st["text"])
     place = queue_place(st)
-    head = (f"<p><a href='/'>← Homework Wizard</a></p><h1>{e(st['title'])}</h1>"
-            f"<div class=stats><span>Status: {e(st['status'])}{' · ' + e(st['step']) if st['status'] == 'running' else ''}"
-            f"{f' · number {place} in the queue' if place else ''}</span>"
+    claims = [c for s in st.get("sections", []) for c in s.get("claims", []) if "verdict" in c]
+    tally = {v: sum(1 for c in claims if c["verdict"] == v) for v in MARKS}
+    score = (f"<div class=score>{tally['supported']}/{len(claims)} check out</div> <span class=mut>"
+             + " · ".join(f"{MARKS[v]}: {tally[v]}" for v in ("partly", "unclear", "contradicted")) + "</span>") if claims else ""
+    head = (f"<p><a href='/'>← Back to the pile</a></p><h1>{e(st['title'])}</h1>{score}"
+            f"<div class=stats><span>{STATUS.get(st['status'], e(st['status']))}"
+            f"{f' · you are number {place} in the pile' if place else ''}</span>"
             f"<span>Original: {orig_words} words · {read_min(orig_words)} min</span>"
             + ("" if student else f"<span>With selected: <span id=nw>{orig_words}</span> words · <span id=nm>{read_min(orig_words)}</span> min</span>")
             + "</div>")
     if st["status"] == "error":
-        head += f"<div class=card><b>Error:</b> {e(st.get('error'))} <form method=post action='/retry/{st['id']}'><button>Resume</button></form></div>"
+        head += f"<div class=card><b>Something went wrong:</b> {e(st.get('error'))} <form method=post action='/retry/{st['id']}'><button>Try again</button></form></div>"
     body = ""
     for si, s in enumerate(st.get("sections", [])):
         body += f"<h2>{e(s['title'])}</h2>" if si else ""
@@ -588,29 +628,29 @@ def report(st):
             body += f"<p data-k='o{si}_{pi}'>{e(p)}</p>"
             for ai, a in adds.get(pi, []):
                 if student:
-                    body += (f"<div class='card add'><b>Tip</b> <span class=mut>— {e(a.get('why'))}</span>"
+                    body += (f"<div class='card add'><b class=hand>Teacher's note</b> <span class=mut>— {e(a.get('why'))}</span>"
                              f"<p>{cite_links(a['text'], s.get('add_evidence', []))}</p></div>")
                 else:
-                    body += (f"<div class='card add' data-k='a{si}_{ai}'><label><input type=checkbox class=pick>Suggested addition"
+                    body += (f"<div class='card add pickable' data-k='a{si}_{ai}'><label><input type=checkbox class=pick>Suggested addition"
                              f" <span class=mut>— {e(a.get('why'))}</span></label><p class=txt>{cite_links(a['text'], s.get('add_evidence', []))}</p></div>")
         body += "</div>"
         if s.get("claims"):
             items = ""
             for c in s["claims"]:
                 if "verdict" not in c:
-                    items += f"<li><span class='v unclear'>pending</span>{e(c['claim'])}</li>"; continue
+                    items += f"<li><span class='v pending'>… marking</span>{e(c['claim'])}</li>"; continue
                 fix = f"<br><b>More accurate:</b> {cite_links(c['correction'], c['evidence'])}" if c.get("correction") else ""
                 srcs = " · ".join(f"<a href='{e(x['url'])}' target=_blank>[{i+1}] {e(urllib.parse.urlparse(x['url']).netloc)}</a>"
                                   for i, x in enumerate(c["evidence"]))
-                items += (f"<li><span class='v {e(c['verdict'])}'>{e(c['verdict'])}</span><b>{e(c['claim'])}</b><br>"
+                items += (f"<li><span class='v {e(c['verdict'])}'>{MARKS.get(c['verdict'], e(c['verdict']))}</span><b>{e(c['claim'])}</b><br>"
                           f"{cite_links(c['note'], c['evidence'])}{fix}<div class=src>{srcs}</div></li>")
-            body += f"<details class='card claims' {'open' if si else ''}><summary><b>Fact check</b> ({len(s['claims'])} claims)</summary><ul>{items}</ul></details>"
+            body += f"<details class='card claims' {'open' if si else ''}><summary><b>Marking sheet</b> ({len(s['claims'])} claims checked)</summary><ul>{items}</ul></details>"
     for ni, x in enumerate(st.get("new", [])):
         srcs = "<br>".join(f"[{i+1}] <a href='{e(v['url'])}' target=_blank>{e(v['title'] or v['url'])}</a>" for i, v in enumerate(x.get("evidence", [])))
         if student:
             tips = "".join(f"<li>{cite_links(t.lstrip('-* ').strip(), x.get('evidence', []))}</li>"
                            for t in (x.get("tips") or "").splitlines() if t.strip())
-            body += (f"<div class='card newsec'><b>Topic you could add:</b> {e(x['title'])}<p class=mut>{e(x.get('angle'))}</p>"
+            body += (f"<div class='card newsec'><b>Idea for extra credit: {e(x['title'])}</b><p class=mut>{e(x.get('angle'))}</p>"
                      + (f"<ul>{tips}</ul><details class=src><summary>Sources to read</summary>{srcs}</details>" if tips else "<p class=mut>(researching…)</p>")
                      + "</div>")
         elif "draft" not in x:
@@ -622,9 +662,9 @@ def report(st):
                      + f"<details class=src><summary>Sources</summary>{srcs}</details></div>")
     tail = ""
     if not student and st["status"] == "done":
-        tail = """<h2>Final text</h2><p class=mut>Tick the suggestions you want above, then build. New sections go before your closing paragraph.
-Citation numbers become a source list at the end.</p><p><button onclick=build()>Build final text</button></p><textarea id=out></textarea>"""
-    logs = f"<details class=card {'open' if running else ''}><summary>Progress log</summary><pre>{e(chr(10).join(st.get('log', [])[-60:]))}</pre></details>"
+        tail = """<h2>Clean copy</h2><p class=mut>Tick the suggestions you want above, then write it out. New sections go before your closing paragraph.
+Citation numbers become a source list at the end.</p><p><button onclick=build()>✏️ Write out the clean copy</button></p><textarea id=out></textarea>"""
+    logs = f"<details class=card {'open' if running else ''}><summary>Teacher's scratch pad (progress log)</summary><pre>{e(chr(10).join(st.get('log', [])[-60:]))}</pre></details>"
     return page(st["title"], head + body + tail + logs + ("" if student else TEACHER_SCRIPT), refresh=running)
 
 
