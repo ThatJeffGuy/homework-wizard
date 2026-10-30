@@ -538,8 +538,9 @@ def make_hint(jid, hid):
             temp=0.4, max_tokens=300)
         status = "done"
     except Exception as ex:
-        text, status = f"The hint could not be made ({ex.__class__.__name__}); your hint was given back.", "error"
-        change_hints(st["owner"], +1)
+        text, status = f"The hint could not be made ({ex.__class__.__name__}); any hint spent on it was given back.", "error"
+        if h.get("paid_by"):
+            change_hints(h["paid_by"], +1)
     with file_lock:
         st = load(jid)
         st["hints"][hid].update(answer=text, status=status, evidence=ev)
@@ -674,13 +675,20 @@ button.side-tab.left{left:0;transform:translateY(-50%);border-radius:0 12px 12px
 .hintbox{background:var(--paper)}.hintbox p{margin:.3em 0}
 #hintbar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:40;display:none;max-width:92vw;
  background:var(--card);border:2px solid var(--ink);border-radius:10px;padding:8px 10px 8px 14px;box-shadow:0 6px 20px rgba(0,0,0,.25);
- align-items:center;gap:12px}#hintbar.show{display:flex}#hintbar span{font-size:.9rem}#hintbar button{flex:none}
+ align-items:center;gap:12px}#hintbar.show{display:flex}#hintbar.nohints{border-style:dashed;color:var(--mut)}
+button:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}.wrap{padding-bottom:110px}#hintbar span{font-size:.9rem}#hintbar button{flex:none}
 .hint{background:#ffe0b2;color:#3b2a10}.hint q{font-style:italic}
 @media (prefers-reduced-motion:reduce){.side,.side.open,button.side-tab{transition:none}}
 """
 
-def student_panel(viewer):
+def student_panel(viewer, teacher=None):
     left, cfg = hints_left(viewer), settings()
+    if teacher:
+        wallet = ("<div class='card hintbox'><h3>Your hints <span class=star>∞</span></h3><p><b>Unlimited</b> (teacher).</p>"
+                  "<p class=mut>On any marked paper, highlight part of the writing and tap <b>Get a hint</b> to see what a "
+                  "student would get.</p></div>")
+        return """<aside class="side left" id=side-student aria-label="Cheat sheet" aria-hidden=true>
+<h2>Cheat Sheet</h2><p class=mut>The legal kind.</p>""" + wallet + STUDENT_TOOLS
     stars = "".join("<span class=star>★</span>" if i < left else "<span class='star off'>☆</span>" for i in range(MAX_HINTS))
     wallet = (f"<div class='card hintbox'><h3>Your hints {stars}</h3><p><b>{left} of {MAX_HINTS}</b> left.</p>"
               "<p class=mut>On a marked paper, highlight a part of your own writing and tap <b>Get a hint</b>. "
@@ -806,14 +814,15 @@ function conv(){const x=parseFloat($('uc-val').value),u=U[kind.value];if(isNaN(x
   else r=x*u[from.value]/u[to.value];
   $('uc-out').textContent=`${x} ${from.value} = ${+r.toPrecision(6)} ${to.value}`}
 kind.addEventListener('change',fillUnits);[from,to,$('uc-val')].forEach(e=>e.addEventListener('input',conv));fillUnits();
-// hints: highlight your own text on a marked paper
-const bar=$('hintbar');
-if(bar){const show=()=>{const sel=getSelection(),t=sel.toString().trim();let k=null;
+// hints: highlight part of a marked paper, then ask
+const bar=$('hintbar'),go=$('hb-go');
+if(go){const def=$('hb-text').textContent;
+  const show=()=>{const sel=getSelection(),t=sel.toString().trim();let k=null;
     if(sel.rangeCount&&t.length>=3&&t.length<=400){const n=sel.getRangeAt(0).commonAncestorContainer;const p=(n.nodeType===1?n:n.parentElement).closest('.orig p[data-k]');if(p)k=p.dataset.k}
-    if(k){bar.classList.add('show');$('hb-text').textContent='“'+(t.length>60?t.slice(0,60)+'…':t)+'”';bar.dataset.k=k;bar.dataset.t=t}
-    else if(!bar.contains(document.activeElement))bar.classList.remove('show')};
+    if(k){$('hb-text').textContent='Hint on “'+(t.length>60?t.slice(0,60)+'…':t)+'”';go.disabled=false;bar.dataset.k=k;bar.dataset.t=t}
+    else if(document.activeElement!==go){$('hb-text').textContent=t?'Highlight inside the writing itself (3 to 400 characters).':def;go.disabled=true}};
   document.addEventListener('selectionchange',()=>setTimeout(show,0));
-  $('hb-go').addEventListener('click',()=>{$('hb-k').value=bar.dataset.k;$('hb-t').value=bar.dataset.t;$('hb-form').submit()});}
+  go.addEventListener('click',()=>{if(go.disabled)return;$('hb-k').value=bar.dataset.k;$('hb-t').value=bar.dataset.t;go.disabled=true;go.textContent='Asking…';$('hb-form').submit()});}
 // study timer (keeps running across page reloads)
 let tick=null;const FOCUS=25*60,BREAK=5*60,baseTitle=document.title;
 function tstate(){return store.get('timer',{mode:'focus',end:0,left:FOCUS})}
@@ -858,7 +867,7 @@ def teacher_panel(teacher, viewer, open_it=False, msg=""):
             "<span class=tab-arrow aria-hidden=true></span><span class=tab-txt>Staff room</span><span class=tab-arrow aria-hidden=true></span></button>")
 
 def drawers(teacher, viewer, open_staff=False, msg=""):
-    return student_panel(viewer) + teacher_panel(teacher, viewer, open_staff, msg) + DRAWER_JS
+    return student_panel(viewer, teacher) + teacher_panel(teacher, viewer, open_staff, msg) + DRAWER_JS
 
 STATUS = {"queued": "In the pile", "running": "Being marked…", "done": "Marked ✓", "error": "Lost in the backpack"}
 MARKS = {"supported": "✓ checks out", "partly": "½ partly right", "unclear": "? needs a source", "contradicted": "✗ check this"}
@@ -948,7 +957,8 @@ document.getElementById('out').value=parts.join('\\n\\n');}
 def report(st, viewer=None, teacher=None):
     running = st["status"] in ("queued", "running")
     hinting = any(h.get("status") == "pending" for h in st.get("hints", []))
-    can_hint = is_student(st) and st["status"] == "done" and st.get("owner") == viewer
+    can_hint = st["status"] == "done" and (bool(teacher) or (is_student(st) and st.get("owner") == viewer))
+    left = "unlimited" if teacher else hints_left(viewer)
     student = is_student(st)
     orig_words = words(st["text"])
     place = queue_place(st)
@@ -969,8 +979,8 @@ def report(st, viewer=None, teacher=None):
                     else f". Score {award.get('needed', settings()['hint_score'])}% or more to earn a hint." if "needed" in award
                     else ", but your hint wallet was already full.") + "</div>")
     if can_hint:
-        head += (f"<p class=mut>Stuck on something? Highlight part of your writing below and tap <b>Get a hint</b> "
-                 f"(you have {hints_left(viewer)} of {MAX_HINTS}).</p>")
+        head += (f"<p class=mut>Stuck on something? Highlight part of the writing below and tap <b>Get a hint</b> "
+                 f"({'teachers get unlimited hints' if teacher else f'you have {left} of {MAX_HINTS}'}).</p>")
     if st["status"] == "error":
         head += f"<div class=card><b>Something went wrong:</b> {e(st.get('error'))} <form method=post action='/retry/{st['id']}'><button>Try again</button></form></div>"
     body = ""
@@ -1030,10 +1040,17 @@ def report(st, viewer=None, teacher=None):
         tail = """<h2>Clean copy</h2><p class=mut>Tick the suggestions you want above, then write it out. New sections go before your closing paragraph.
 Citation numbers become a source list at the end.</p><p><button onclick=build()>✏️ Write out the clean copy</button></p><textarea id=out></textarea>"""
     logs = f"<details class=card {'open' if running else ''}><summary>Teacher's scratch pad (progress log)</summary><pre>{e(chr(10).join(st.get('log', [])[-60:]))}</pre></details>"
-    bar = ("<div id=hintbar role=dialog aria-label='Get a hint'><span>Hint on <b id=hb-text></b></span>"
-           f"<button type=button id=hb-go>Get a hint ({hints_left(viewer)} left)</button></div>"
-           f"<form id=hb-form method=post action='/hint/{st['id']}' hidden><input name=k id=hb-k><input name=text id=hb-t></form>"
-           if can_hint and hints_left(viewer) > 0 else "")
+    if can_hint and (teacher or left > 0):
+        bar = ("<div id=hintbar class=show role=region aria-label='Hints'><span id=hb-text>Highlight part of the writing above to get a hint.</span>"
+               f"<button type=button id=hb-go disabled>Get a hint{'' if teacher else f' ({left} left)'}</button></div>"
+               f"<form id=hb-form method=post action='/hint/{st['id']}' hidden><input name=k id=hb-k><input name=text id=hb-t></form>")
+    elif can_hint:
+        bar = (f"<div id=hintbar class='show nohints' role=region aria-label='Hints'><span>No hints left. Score {settings()['hint_score']}% "
+               "or more on a marked paper to earn another.</span></div>")
+    elif is_student(st) and st.get("owner") == viewer or teacher:
+        bar = "<div id=hintbar class='show nohints' role=region aria-label='Hints'><span>Hints unlock when marking is finished.</span></div>"
+    else:
+        bar = ""
     return page(st["title"], head + body + tail + logs + bar + ("" if student else TEACHER_SCRIPT), refresh=running or hinting,
                 side=drawers(teacher, viewer))
 
@@ -1117,15 +1134,16 @@ class H(BaseHTTPRequestHandler):
         if m:
             st = self.job(m.group(1), teacher)
             k, text = f("k"), " ".join(f("text").split())[:400]
-            ok = (st and is_student(st) and st["status"] == "done" and st.get("owner") == vid and re.fullmatch(r"o\d+_\d+", k)
+            ok = (st and st["status"] == "done" and (teacher or (is_student(st) and st.get("owner") == vid)) and re.fullmatch(r"o\d+_\d+", k)
                   and len(text) >= 3 and text in " ".join(st["text"].split()))
             if not ok:
                 return self.send(400, page("Hint", "<p>That can't get a hint. Highlight part of your own writing on a marked paper. <a href='/'>Back</a></p>"))
-            if change_hints(vid, -1) is None:
+            if not teacher and change_hints(vid, -1) is None:
                 return self.send(303, "", loc=f"/job/{st['id']}")
             with file_lock:
                 st = load(st["id"])
-                st.setdefault("hints", []).append({"k": k, "text": text, "status": "pending", "asked": time.time()})
+                st.setdefault("hints", []).append({"k": k, "text": text, "status": "pending", "asked": time.time(),
+                                                   "paid_by": None if teacher else vid})
                 save(st)
             threading.Thread(target=make_hint, args=(st["id"], len(st["hints"]) - 1), daemon=True).start()
             return self.send(303, "", loc=f"/job/{st['id']}")
