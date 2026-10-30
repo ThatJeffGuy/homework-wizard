@@ -682,8 +682,10 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/teacher":
             ip = (self.headers.get(IP_HEADER, "") if IP_HEADER else "").strip() or self.client_address[0]
             if lock_left(ip):
+                print(f"login refused (locked out) for {f('email')[:100]!r} from {ip}", flush=True)
                 return self.send(429, home(vid, None, f"Too many wrong passwords. Try again in {lock_left(ip) // 60 + 1} minutes."))
             name = check_login(f("email"), f("password"))
+            print(f"login {'ok' if name else 'FAILED'} for {f('email')[:100]!r} from {ip}", flush=True)
             if not name:
                 login_failed(ip); time.sleep(1.5)
                 left = LOCK_ATTEMPTS - len(failed.get(ip, []))
