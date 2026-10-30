@@ -320,6 +320,7 @@ def is_student(st):
 
 def run_job(jid):
     st = load(jid)
+    st.setdefault("started", time.time())
     try:
         while st["step"] != "done":
             st["status"] = "running"; log(st, "step: " + st["step"])
@@ -509,6 +510,14 @@ footer{margin-top:48px;padding-top:12px;border-top:1px solid var(--line);color:v
 table{width:100%;border-collapse:collapse}td{padding:7px 4px;border-bottom:1px solid var(--rule)}
 details.teacher{margin-top:32px}details.teacher form{display:flex;gap:10px;flex-wrap:wrap}details.teacher input{flex:1 1 220px;width:auto}
 summary{cursor:pointer}
+.progress{position:sticky;top:0;z-index:5;background:var(--paper);margin:-28px -18px 10px -16px;padding:12px 18px 10px 16px;
+ border-bottom:1px solid var(--line)}
+.bar{height:16px;border:2px solid var(--ink);border-radius:3px 10px 10px 3px;background:var(--card);overflow:hidden}
+.bar i{display:block;height:100%;background:repeating-linear-gradient(45deg,var(--pencil) 0 10px,#ffe07a 10px 20px);
+ border-right:3px solid var(--pencil-edge);transition:width .6s;animation:slide 1.2s linear infinite;background-size:28px 28px}
+@keyframes slide{to{background-position:28px 0}}
+@media (prefers-reduced-motion:reduce){.bar i{animation:none}}
+.plabel{font-size:.9rem;margin-top:4px;color:var(--mut)}.plabel b{color:var(--ink)}
 @media (max-width:520px){.wrap{padding-left:30px}.wrap::before{left:16px}h1{font-size:1.7rem}}
 """
 
@@ -517,7 +526,7 @@ FOOTER = (f"<footer><b>Made by <a href='https://www.everydaysciencestuff.com' ta
           f" · <a href='{REPO}' target=_blank rel=noopener>Source on GitHub</a></footer>")
 
 def page(title, body, refresh=False):
-    meta = '<meta http-equiv="refresh" content="20">' if refresh else ""
+    meta = '<meta http-equiv="refresh" content="15">' if refresh else ""
     return (f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
             f"{meta}<title>{html.escape(title)}</title><style>{CSS}</style></head><body><div class=wrap>{body}{FOOTER}</div></body></html>")
 
@@ -541,6 +550,41 @@ HAT = ("<svg viewBox='0 0 64 64' aria-hidden=true><path d='M6 52Q32 43 58 52Q32 
 STATUS = {"queued": "In the pile", "running": "Being marked…", "done": "Marked ✓", "error": "Lost in the backpack"}
 MARKS = {"supported": "✓ checks out", "partly": "½ partly right", "unclear": "? needs a source", "contradicted": "✗ check this"}
 
+# step -> (share of the total time, what the student sees)
+PHASES = {"sections": (0.01, "Reading your draft"), "claims": (0.06, "Finding the claims to check"),
+          "research": (0.12, "Looking up sources"), "verdicts": (0.45, "Checking claims against sources"),
+          "newsections": (0.18, "Looking for extra topic ideas"), "additions": (0.18, "Writing the teacher's notes")}
+
+def progress(st):
+    """(percent done, label) for a running job, from the step it is on and how far through that step it is."""
+    secs = st.get("sections", [])
+    claims = [c for x in secs for c in x.get("claims", [])]
+    step, done_share = st["step"], 0.0
+    for name, (share, _) in PHASES.items():
+        if name == step:
+            break
+        done_share += share
+    part = {"claims": lambda: (sum("claims" in x for x in secs), len(secs)),
+            "research": lambda: (sum("evidence" in c for c in claims), len(claims)),
+            "verdicts": lambda: (sum("verdict" in c for c in claims), len(claims)),
+            "newsections": lambda: (sum(("tips" in x or "draft" in x) for x in st.get("new", [])), len(st.get("new", [])) or 1),
+            "additions": lambda: (sum("additions" in x for x in secs), len(secs))}.get(step, lambda: (0, 1))()
+    n, total = part
+    share, label = PHASES.get(step, (0, step))
+    pct = min(99, int(100 * (done_share + share * (n / total if total else 0))))
+    return pct, f"{label}" + (f": {n} of {total}" if step in ("research", "verdicts") and total else "")
+
+def progress_bar(st):
+    if st["status"] == "queued":
+        place = queue_place(st)
+        return (f"<div class=progress><div class=bar><i style='width:0%'></i></div><div class=plabel>Waiting in the pile"
+                f"{f' (you are number {place})' if place else ''}. Marking starts when the papers ahead of yours are done.</div></div>")
+    pct, label = progress(st)
+    took = time.time() - st.get("started", st["created"])
+    left = f" · roughly {max(1, round(took / pct * (100 - pct) / 60))} min left" if pct >= 8 else ""
+    return (f"<div class=progress><div class=bar role=progressbar aria-valuenow={pct} aria-valuemin=0 aria-valuemax=100>"
+            f"<i style='width:{pct}%'></i></div><div class=plabel>✏ {e(label)} · <b>{pct}%</b>{left}</div></div>")
+
 def queue_place(st):
     if st["status"] != "queued":
         return 0
@@ -550,7 +594,7 @@ def home(viewer, teacher, msg=""):
     mine = [s for s in all_jobs() if s.get("owner") == viewer or (teacher and not s.get("owner"))]
     rows = "".join(
         f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{'teacher' if not is_student(s) else 'student'}</td>"
-        f"<td>{STATUS.get(s['status'], e(s['status']))}</td>"
+        f"<td>{STATUS.get(s['status'], e(s['status']))}{f' {progress(s)[0]}%' if s['status'] == 'running' else ''}</td>"
         f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created']))}</td></tr>" for s in mine)
     mode_pick = ("<select name=mode><option value=teacher>Teacher: draft sourced additions</option>"
                  "<option value=student>Student: check and coach</option></select>") if teacher else ""
@@ -605,7 +649,7 @@ def report(st):
     tally = {v: sum(1 for c in claims if c["verdict"] == v) for v in MARKS}
     score = (f"<div class=score>{tally['supported']}/{len(claims)} check out</div> <span class=mut>"
              + " · ".join(f"{MARKS[v]}: {tally[v]}" for v in ("partly", "unclear", "contradicted")) + "</span>") if claims else ""
-    head = (f"<p><a href='/'>← Back to the pile</a></p><h1>{e(st['title'])}</h1>{score}"
+    head = ((progress_bar(st) if running else "") + f"<p><a href='/'>← Back to the pile</a></p><h1>{e(st['title'])}</h1>{score}"
             f"<div class=stats><span>{STATUS.get(st['status'], e(st['status']))}"
             f"{f' · you are number {place} in the pile' if place else ''}</span>"
             f"<span>Original: {orig_words} words · {read_min(orig_words)} min</span>"
