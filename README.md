@@ -34,8 +34,9 @@ python3 add_teacher.py --list
 python3 add_teacher.py --remove ms.smith@school.example   # also logs her out everywhere
 ```
 Run it with the same `DATA_DIR` (or `TEACHERS_FILE`) as the server. Passwords are stored salted and hashed
-(PBKDF2-SHA256, 600,000 rounds) in `teachers.json`, logins last 30 days, and after 10 wrong passwords an address is
-blocked for 15 minutes.
+(PBKDF2-SHA256, 600,000 rounds) in `teachers.json`, logins last 30 days, and after 3 wrong passwords an address is
+locked out for 1 hour. Behind a reverse proxy, set `CLIENT_IP_HEADER` (see below) or every visitor shares the proxy's
+address and one student's wrong guesses would lock everyone out.
 
 ## Requirements
 - Python 3.10+ (standard library only, nothing to `pip install`)
@@ -64,6 +65,7 @@ Settings (environment variables):
 | `DATA_DIR` | `/var/lib/homework-wizard/jobs` | where jobs are saved |
 | `TEACHERS_FILE` | `teachers.json` next to `DATA_DIR` | teacher logins (hashed passwords) |
 | `SECRET_FILE` | `secret.key` next to `DATA_DIR` | signs teacher logins (created automatically) |
+| `CLIENT_IP_HEADER` | none | header holding the visitor's real address, set by your proxy, e.g. `CF-Connecting-IP` (Cloudflare) or `X-Real-IP` (nginx with `proxy_set_header X-Real-IP $remote_addr`). Only set it if every request goes through that proxy, since visitors could fake it otherwise |
 | `PORT` | `8501` | web port |
 | `THREADS` | Ollama's choice | CPU threads for the model (on CPU-only setups, roughly your physical core count) |
 

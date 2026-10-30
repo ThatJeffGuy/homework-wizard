@@ -382,7 +382,9 @@ def teacher_additions(st, s, ev, notes, numbered):
 # ---------- teacher logins + sessions ----------
 PBKDF2_ROUNDS = 600_000
 MIN_PASSWORD = 10
-failed = {}   # ip -> [failure times], for slowing down password guessing
+LOCK_ATTEMPTS, LOCK_SECONDS = 3, 3600   # 3 wrong passwords = that address is locked out for 1 hour
+IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "")  # e.g. CF-Connecting-IP, only if your proxy always sets it
+failed, locked = {}, {}   # ip -> [failure times] / ip -> locked until
 
 def read_keys():
     try:
@@ -419,10 +421,16 @@ def check_login(email, password):
     ok = hmac.compare_digest(hash_password(password, salt, rounds), rec.get("hash", "") if rec else "")
     return norm_email(email) if (rec and ok) else None
 
-def login_blocked(ip):
+def lock_left(ip):
+    """Seconds this address is still locked out for (0 = may try)."""
+    return max(0, int(locked.get(ip, 0) - time.time()))
+
+def login_failed(ip):
     now = time.time()
-    failed[ip] = [t for t in failed.get(ip, []) if now - t < 900]
-    return len(failed[ip]) >= 10
+    failed[ip] = [t for t in failed.get(ip, []) if now - t < LOCK_SECONDS] + [now]
+    if len(failed[ip]) >= LOCK_ATTEMPTS:
+        locked[ip] = now + LOCK_SECONDS
+        failed.pop(ip)
 
 def server_secret():
     os.makedirs(os.path.dirname(SECRET_FILE) or ".", exist_ok=True)
@@ -672,13 +680,16 @@ class H(BaseHTTPRequestHandler):
         form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
         f = lambda k, d="": form.get(k, [d])[0]
         if self.path == "/teacher":
-            ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
-            if login_blocked(ip):
-                return self.send(429, home(vid, None, "Too many failed logins. Try again in 15 minutes."))
+            ip = (self.headers.get(IP_HEADER, "") if IP_HEADER else "").strip() or self.client_address[0]
+            if lock_left(ip):
+                return self.send(429, home(vid, None, f"Too many wrong passwords. Try again in {lock_left(ip) // 60 + 1} minutes."))
             name = check_login(f("email"), f("password"))
             if not name:
-                failed.setdefault(ip, []).append(time.time()); time.sleep(1.5)
-                return self.send(403, home(vid, None, "Wrong email or password."))
+                login_failed(ip); time.sleep(1.5)
+                left = LOCK_ATTEMPTS - len(failed.get(ip, []))
+                return self.send(403, home(vid, None, "Wrong email or password." + (
+                    f" {left} attempt{'s' if left > 1 else ''} left before a 1-hour lockout." if not lock_left(ip)
+                    else " Locked out for 1 hour.")))
             failed.pop(ip, None)
             return self.send(303, "", loc="/", cookies=[f"hw_teacher={make_session(name)}; Path=/; Max-Age={SESSION_DAYS * 86400}; HttpOnly; SameSite=Lax"])
         if self.path == "/teacher/logout":
