@@ -4,8 +4,8 @@
 It checks work, it does not write it: every suggestion is a pointer (what to look into, which source says so),
 never text that could be pasted in.
 
-Teacher mode is an optional add-on, teacher_mode.py, distributed separately by the author (it is not in this
-repository). Drop it next to this file and restart, and a mode picker appears.
+Teacher mode also drafts sourced additions and new sections. Only signed-in teachers get it: the school creates a key
+per teacher with  python3 homework_wizard.py teacher-key add "Name"  (see README).
 
 Made by That Scottish Guy (https://www.everydaysciencestuff.com) - MIT licence, see LICENSE.
 
@@ -13,7 +13,8 @@ Pipeline per job (each step is saved to state.json, so a restart resumes where i
   sections -> claims -> research (SearXNG + page fetch) -> verdicts -> topic ideas -> tips -> done
 The student's text is never rewritten.
 """
-import hashlib, hmac, html, importlib, json, os, re, sys, threading, time, traceback, urllib.parse, urllib.request, uuid
+import hashlib, hmac, html, json, os, re, secrets, sys, threading, time, traceback, urllib.parse, urllib.request
+from http.cookies import SimpleCookie
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -29,9 +30,10 @@ REPO = "https://github.com/ThatJeffGuy/homework-wizard"
 STEPS = ["sections", "claims", "research", "verdicts", "newsections", "additions", "done"]
 
 wake = threading.Event()
-ADDON = None   # optional teacher_mode.py add-on, loaded at start-up (see load_addon)
-LICENSEE = ""
-MODES = ["student"]
+_base = os.path.dirname(os.path.abspath(DATA))
+KEYS = os.environ.get("KEYS_FILE", os.path.join(_base, "teachers.json"))       # hashed teacher keys
+SECRET_FILE = os.environ.get("SECRET_FILE", os.path.join(_base, "secret.key"))  # signs teacher sessions
+SESSION_DAYS = 30
 
 
 # ---------- storage ----------
@@ -282,7 +284,7 @@ def step_newsections(st):
                 "EVIDENCE:\n" + evidence_block(x["evidence"])}], temp=0.4, max_tokens=500)
             log(st, f"tips for possible section '{x['title']}'")
         if not is_student(st):
-            ADDON.new_section(st, x, subject=subject, anchor=anchor, intro=intro, sample=sample)
+            teacher_section(st, x, subject, anchor, intro, sample)
 
 def step_additions(st):
     for s in st["sections"]:
@@ -310,11 +312,11 @@ def step_additions(st):
             s["additions"] = [a for a in (r.get("additions") or []) if a.get("text")][:3]
             log(st, f"feedback for '{s['title']}': {len(s['additions'])}")
             continue
-        ADDON.additions(st, s, ev, notes, numbered)
+        teacher_additions(st, s, ev, notes, numbered)
 
 
 def is_student(st):
-    return st.get("mode", "student") == "student" or ADDON is None
+    return st.get("mode", "student") == "student"
 
 def run_job(jid):
     st = load(jid)
@@ -340,6 +342,116 @@ def worker():
         wake.wait(30); wake.clear()
 
 
+# ---------- teacher mode (drafts sourced text; only for signed-in teachers) ----------
+SYS_TEACHER = ("You are a careful research editor. You help the writer flesh out and fact-check their own draft, matching "
+               "their tone, voice and spelling conventions. You never invent facts: anything you state must come from the "
+               "numbered evidence you are given, and you cite it like [2]. If the evidence does not support something, "
+               "say so plainly.")
+
+def teacher_section(st, x, subject, anchor, intro, sample):
+    if "draft" in x:
+        return
+    x["draft"] = llm([{"role": "system", "content": SYS_TEACHER}, {"role": "user", "content":
+        f"Write a new section titled \"{x['title']}\" for the article.\n{anchor}\n"
+        f"Structure: start from what {subject} is shown doing (the draft's words above), then test it against "
+        "real-world science and numbers from the evidence, then conclude. Every paragraph must tie back to "
+        f"{subject}. 200-350 words in the writer's voice (see the samples). Use ONLY facts from the evidence, "
+        "cited like [2]; never write 'the article' or 'the source' - name the source or just cite it. Where the "
+        "evidence is thin, say what is unknown instead of guessing. If the writer's sections end with a "
+        "recurring line or verdict, end the same way.\n\n"
+        "ARTICLE INTRO:\n" + intro + "\n\nWRITER SAMPLE SECTION:\n" + sample +
+        "\n\nEVIDENCE:\n" + evidence_block(x["evidence"]) + "\n\nWrite only the section body, no heading."}],
+        temp=0.6, max_tokens=900)
+    log(st, f"drafted new section '{x['title']}' ({words(x['draft'])} words)")
+
+def teacher_additions(st, s, ev, notes, numbered):
+    r = llm([{"role": "system", "content": SYS_TEACHER}, {"role": "user", "content":
+        "Suggest 1 to 3 additions that flesh out this section for a longer read: extra real-world detail, a "
+        "comparison, a number with context, or a short explanation of the science. Do NOT repeat or rewrite the "
+        "writer's text. Each addition 50-150 words, in the writer's voice, ONLY facts from the evidence, with [n] "
+        "citations. Say after which paragraph it goes.\n"
+        'Reply as JSON: {"additions":[{"after":<paragraph number>,"why":"short reason","text":"..."}]}\n\n'
+        f"SUBJECT: {st.get('subject') or '(see the section)'}. Stay about it; add nothing the draft and evidence do not support.\n\n"
+        "FACT-CHECK RESULTS:\n" + "\n".join(notes) + f"\n\nSECTION \"{s['title']}\":\n" + numbered +
+        "\n\nEVIDENCE:\n" + evidence_block(ev)}], as_json=True, temp=0.6, max_tokens=1200)
+    s["add_evidence"] = ev
+    s["additions"] = [a for a in (r.get("additions") or []) if a.get("text")][:3]
+    log(st, f"additions for '{s['title']}': {len(s['additions'])}")
+
+
+# ---------- teacher keys + sessions ----------
+def read_keys():
+    try:
+        with open(KEYS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+def write_keys(keys):
+    os.makedirs(os.path.dirname(KEYS) or ".", exist_ok=True)
+    with open(KEYS + ".tmp", "w") as f:
+        json.dump(keys, f, indent=1)
+    os.chmod(KEYS + ".tmp", 0o600)
+    os.replace(KEYS + ".tmp", KEYS)
+
+def key_hash(key):
+    return hashlib.sha256(("homework-wizard-teacher:" + key.strip()).encode()).hexdigest()
+
+def teacher_for_key(key):
+    h = key_hash(key)
+    for name, rec in read_keys().items():
+        if hmac.compare_digest(rec["hash"], h):
+            return name
+    return None
+
+def server_secret():
+    os.makedirs(os.path.dirname(SECRET_FILE) or ".", exist_ok=True)
+    if not os.path.exists(SECRET_FILE):
+        with open(SECRET_FILE, "w") as f:
+            f.write(secrets.token_hex(32))
+        os.chmod(SECRET_FILE, 0o600)
+    with open(SECRET_FILE) as f:
+        return f.read().strip().encode()
+
+def make_session(name):
+    exp = str(int(time.time()) + SESSION_DAYS * 86400)
+    body = urllib.parse.quote(name) + "|" + exp
+    return body + "|" + hmac.new(server_secret(), body.encode(), "sha256").hexdigest()
+
+def session_teacher(cookie):
+    """Name of the signed-in teacher, or None. Removing a teacher's key also ends their sessions."""
+    try:
+        qname, exp, sig = cookie.split("|")
+    except (AttributeError, ValueError):
+        return None
+    body = qname + "|" + exp
+    if not hmac.compare_digest(sig, hmac.new(server_secret(), body.encode(), "sha256").hexdigest()):
+        return None
+    name = urllib.parse.unquote(qname)
+    return name if int(exp) > time.time() and name in read_keys() else None
+
+def teacher_key_cli(args):
+    usage = ('usage: homework_wizard.py teacher-key add "Name" | remove "Name" | list\n'
+             f"(keys file: {KEYS}; set DATA_DIR / KEYS_FILE the same way as for the server)")
+    keys = read_keys()
+    if args[:1] == ["add"] and len(args) == 2:
+        name = args[1].strip()
+        if not name or name in keys:
+            sys.exit(f"'{name}' already has a key; remove it first to make a new one." if name else usage)
+        key = "-".join(secrets.token_hex(3).upper() for _ in range(5))   # 120 random bits
+        keys[name] = {"hash": key_hash(key), "created": time.strftime("%Y-%m-%d")}
+        write_keys(keys)
+        print(f"Teacher key for {name} (shown only once, give it to them privately):\n\n    {key}\n")
+    elif args[:1] == ["remove"] and len(args) == 2:
+        if keys.pop(args[1].strip(), None) is None:
+            sys.exit(f"no key for '{args[1]}'")
+        write_keys(keys); print(f"removed {args[1]} (their sessions end too)")
+    elif args == ["list"]:
+        print("\n".join(f"{n}  (created {r['created']})" for n, r in sorted(keys.items())) or "no teacher keys yet")
+    else:
+        sys.exit(usage)
+
+
 # ---------- web ----------
 CSS = """
 :root{--bg:#f7f6f2;--fg:#1d1d1b;--mut:#6b6a64;--card:#fff;--line:#e2e0d8;--acc:#2f6f5e;
@@ -350,8 +462,9 @@ CSS = """
 .wrap{max-width:860px;margin:0 auto;padding:24px 16px 80px}h1{font-size:1.6rem;margin:.2em 0}
 h2{font-size:1.25rem;margin:2em 0 .4em;padding-top:.6em;border-top:1px solid var(--line)}
 .mut{color:var(--mut);font-size:.9rem}a{color:var(--acc)}
-textarea,input{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
+textarea,input,select{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
 textarea{min-height:340px}button{font:inherit;padding:9px 18px;border:0;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer}
+button.link{background:none;color:var(--acc);padding:0;text-decoration:underline}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:10px 0}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.row>*{flex:1 1 160px}
 .v{display:inline-block;font-size:.75rem;font-weight:600;text-transform:uppercase;padding:1px 8px;border-radius:99px;color:#fff;margin-right:6px}
@@ -360,8 +473,9 @@ textarea{min-height:340px}button{font:inherit;padding:9px 18px;border:0;border-r
 .add label,.newsec label{font-weight:600;font-size:.85rem;display:flex;gap:8px;align-items:center;cursor:pointer}
 .src{font-size:.82rem}.src a{word-break:break-all}.orig p{margin:.7em 0}
 pre{white-space:pre-wrap;font:13px/1.45 ui-monospace,monospace;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:260px;overflow:auto}
-footer{margin-top:48px;padding-top:12px;border-top:1px solid var(--line);color:var(--mut);font-size:.85rem}
+footer{margin-top:48px;padding-top:12px;border-top:1px solid var(--line);color:var(--mut);font-size:.85rem;text-align:center}
 .stats{display:flex;gap:18px;flex-wrap:wrap;font-weight:600}table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-bottom:1px solid var(--line)}
+details.teacher{margin-top:28px}details.teacher form{display:flex;gap:10px;flex-wrap:wrap}details.teacher input{flex:1 1 220px;width:auto}
 """
 
 FOOTER = (f"<footer><b>Made by <a href='https://www.everydaysciencestuff.com' target=_blank rel=noopener>That Scottish Guy</a></b>"
@@ -386,34 +500,69 @@ def cite_links(text, ev):
         return "[" + ",".join(out) + "]"
     return re.sub(r"\[\d+(?:\s*,\s*\d+)*\]", sub, t)
 
-def home():
+def queue_place(st):
+    if st["status"] != "queued":
+        return 0
+    return 1 + sum(1 for s in all_jobs() if s["status"] in ("queued", "running") and s["created"] < st["created"])
+
+def home(viewer, teacher, msg=""):
+    mine = [s for s in all_jobs() if s.get("owner") == viewer or (teacher and not s.get("owner"))]
     rows = "".join(
-        f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{e(s.get('mode', 'student'))}</td><td>{e(s['status'])}"
-        f"{' · ' + e(s['step']) if s['status'] == 'running' else ''}</td>"
-        f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created']))}</td></tr>" for s in all_jobs())
-    mode_pick = "" if len(MODES) < 2 else ("<select name=mode>" + "".join(
-        f"<option value={m}>{'Student: check and coach' if m == 'student' else e(ADDON.LABELS.get(m, m))}</option>"
-        for m in MODES) + "</select>")
+        f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{'teacher' if not is_student(s) else 'student'}</td>"
+        f"<td>{e(s['status'])}{' · ' + e(s['step']) if s['status'] == 'running' else ''}</td>"
+        f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created']))}</td></tr>" for s in mine)
+    mode_pick = ("<select name=mode><option value=teacher>Teacher: draft sourced additions</option>"
+                 "<option value=student>Student: check and coach</option></select>") if teacher else ""
+    if teacher:
+        who = (f"<p class=mut>Signed in as teacher: <b>{e(teacher)}</b> · <form method=post action=/teacher/logout "
+               f"style=display:inline><button class=link>sign out</button></form></p>")
+    else:
+        who = ("<details class=teacher><summary class=mut>Teacher? Sign in with your key</summary>"
+               "<form method=post action=/teacher class=card><input name=key type=password autocomplete=off "
+               "placeholder='Teacher key' required><button>Sign in</button></form></details>")
     return page("Homework Wizard", f"""<h1>Homework Wizard</h1>
 <p class=mut>Paste your own draft. A local model checks every claim against web sources and tells you what
 holds up, what to fix and what could make it stronger, with the sources to read. It checks your work; it does not
-write it. On a CPU a full piece takes roughly 20-60 minutes; you can close this page.</p>
+write it. A full piece can take 20-60 minutes, and jobs run one at a time; you can close this page and come back.</p>
+{f"<div class=card><b>{e(msg)}</b></div>" if msg else ""}
 <form method=post action=/new class=card>
-<div class=row><input name=title placeholder="Title" required><input name=extra type=number min=0 max=6 value=3 title="New sections">{mode_pick}</div>
+<div class=row><input name=title placeholder="Title" required><input name=extra type=number min=0 max=6 value=3 title="Extra topics">{mode_pick}</div>
 <p class=mut>Number box = how many extra topics to suggest.</p>
 <textarea name=text placeholder="Paste your draft here. Put headings on their own line." required></textarea>
 <p><button>Start</button></p></form>
-{f"<p class=mut>Teacher mode: licensed to {e(LICENSEE)}</p>" if LICENSEE else ""}
-<h2>Jobs</h2><table>{rows or '<tr><td class=mut>None yet.</td></tr>'}</table>""")
+<h2>Your jobs</h2><table>{rows or '<tr><td class=mut>None yet (only jobs started from this browser are listed).</td></tr>'}</table>
+{who}""")
+
+TEACHER_SCRIPT = """<script>
+const W=t=>(t.match(/\\b\\w[\\w'’-]*\\b/g)||[]).length;
+function picked(){return [...document.querySelectorAll('.pick:checked')].map(c=>c.closest('[data-k]'))}
+function count(){let n=W([...document.querySelectorAll('.orig p[data-k]')].map(p=>p.innerText).join(' '));
+for(const b of picked())n+=W([...b.querySelectorAll('.txt,.hd')].map(p=>p.innerText).join(' '));
+document.getElementById('nw').textContent=n;document.getElementById('nm').textContent=Math.max(1,Math.round(n/238));}
+if(document.getElementById('nw'))document.addEventListener('change',count);
+function build(){const src=[],idx=new Map();
+const fix=el=>{let t=el.innerText;el.querySelectorAll('a').forEach(a=>{if(!idx.has(a.href)){src.push(a.href);idx.set(a.href,src.length)}
+t=t.replace('['+a.textContent+']','[S'+idx.get(a.href)+']').replace(a.textContent+',','S'+idx.get(a.href)+',').replace(','+a.textContent+']',',S'+idx.get(a.href)+']')});return t.replace(/\\[S/g,'[').replace(/,S/g,',')};
+const parts=[],news=[...document.querySelectorAll('.newsec[data-k]')].filter(b=>b.querySelector('.pick').checked);
+const secs=[...document.querySelectorAll('.orig')];
+secs.forEach((o,i)=>{const h=o.previousElementSibling;if(h&&h.tagName==='H2')parts.push(h.innerText+':');
+const kids=[...o.children];kids.forEach((k,j)=>{const last=i===secs.length-1&&j===kids.length-1&&k.tagName==='P';
+if(last)news.forEach(n=>{parts.push(n.querySelector('.hd').innerText+':');n.querySelectorAll('.txt').forEach(p=>parts.push(fix(p)))});
+if(k.tagName==='P')parts.push(k.innerText);else if(k.querySelector('.pick').checked)parts.push(fix(k.querySelector('.txt')))})});
+if(src.length)parts.push('Sources:\\n'+src.map((s,i)=>'['+(i+1)+'] '+s).join('\\n'));
+document.getElementById('out').value=parts.join('\\n\\n');}
+</script>"""
 
 def report(st):
     running = st["status"] in ("queued", "running")
     student = is_student(st)
     orig_words = words(st["text"])
+    place = queue_place(st)
     head = (f"<p><a href='/'>← Homework Wizard</a></p><h1>{e(st['title'])}</h1>"
-            f"<div class=stats><span>Status: {e(st['status'])}{' · ' + e(st['step']) if running else ''}</span>"
+            f"<div class=stats><span>Status: {e(st['status'])}{' · ' + e(st['step']) if st['status'] == 'running' else ''}"
+            f"{f' · number {place} in the queue' if place else ''}</span>"
             f"<span>Original: {orig_words} words · {read_min(orig_words)} min</span>"
-            + ("" if student else ADDON.stats(orig_words))
+            + ("" if student else f"<span>With selected: <span id=nw>{orig_words}</span> words · <span id=nm>{read_min(orig_words)}</span> min</span>")
             + "</div>")
     if st["status"] == "error":
         head += f"<div class=card><b>Error:</b> {e(st.get('error'))} <form method=post action='/retry/{st['id']}'><button>Resume</button></form></div>"
@@ -434,8 +583,9 @@ def report(st):
                 if student:
                     body += (f"<div class='card add'><b>Tip</b> <span class=mut>— {e(a.get('why'))}</span>"
                              f"<p>{cite_links(a['text'], s.get('add_evidence', []))}</p></div>")
-                    continue
-                body += ADDON.render_addition(si, ai, a, s)
+                else:
+                    body += (f"<div class='card add' data-k='a{si}_{ai}'><label><input type=checkbox class=pick>Suggested addition"
+                             f" <span class=mut>— {e(a.get('why'))}</span></label><p class=txt>{cite_links(a['text'], s.get('add_evidence', []))}</p></div>")
         body += "</div>"
         if s.get("claims"):
             items = ""
@@ -449,132 +599,120 @@ def report(st):
                           f"{cite_links(c['note'], c['evidence'])}{fix}<div class=src>{srcs}</div></li>")
             body += f"<details class='card claims' {'open' if si else ''}><summary><b>Fact check</b> ({len(s['claims'])} claims)</summary><ul>{items}</ul></details>"
     for ni, x in enumerate(st.get("new", [])):
+        srcs = "<br>".join(f"[{i+1}] <a href='{e(v['url'])}' target=_blank>{e(v['title'] or v['url'])}</a>" for i, v in enumerate(x.get("evidence", [])))
         if student:
-            srcs = "<br>".join(f"[{i+1}] <a href='{e(v['url'])}' target=_blank>{e(v['title'] or v['url'])}</a>" for i, v in enumerate(x.get("evidence", [])))
             tips = "".join(f"<li>{cite_links(t.lstrip('-* ').strip(), x.get('evidence', []))}</li>"
                            for t in (x.get("tips") or "").splitlines() if t.strip())
             body += (f"<div class='card newsec'><b>Topic you could add:</b> {e(x['title'])}<p class=mut>{e(x.get('angle'))}</p>"
                      + (f"<ul>{tips}</ul><details class=src><summary>Sources to read</summary>{srcs}</details>" if tips else "<p class=mut>(researching…)</p>")
                      + "</div>")
-            continue
-        body += ADDON.render_new(ni, x)
-    tail = "" if student else ADDON.tail(st)
+        elif "draft" not in x:
+            body += f"<div class='card newsec'><b>New section planned:</b> {e(x['title'])} <span class=mut>(drafting…)</span></div>"
+        else:
+            body += (f"<div class='card newsec' data-k='n{ni}'><label><input type=checkbox class=pick>Suggested new section</label>"
+                     f"<h3 class=hd>{e(x['title'])}</h3><p class=mut>{e(x.get('angle'))}</p>"
+                     + "".join(f"<p class=txt>{cite_links(p, x['evidence'])}</p>" for p in x["draft"].split("\n\n") if p.strip())
+                     + f"<details class=src><summary>Sources</summary>{srcs}</details></div>")
+    tail = ""
+    if not student and st["status"] == "done":
+        tail = """<h2>Final text</h2><p class=mut>Tick the suggestions you want above, then build. New sections go before your closing paragraph.
+Citation numbers become a source list at the end.</p><p><button onclick=build()>Build final text</button></p><textarea id=out></textarea>"""
     logs = f"<details class=card {'open' if running else ''}><summary>Progress log</summary><pre>{e(chr(10).join(st.get('log', [])[-60:]))}</pre></details>"
-    script = "" if student else ADDON.SCRIPT
-    return page(st["title"], head + body + tail + logs + script, refresh=running)
+    return page(st["title"], head + body + tail + logs + ("" if student else TEACHER_SCRIPT), refresh=running)
 
 
 class H(BaseHTTPRequestHandler):
-    def send(self, code, body, ctype="text/html; charset=utf-8", loc=None):
+    def cookies(self):
+        c = SimpleCookie()
+        try:
+            c.load(self.headers.get("Cookie", ""))
+        except Exception:
+            pass
+        return {k: v.value for k, v in c.items()}
+
+    def who(self):
+        """(browser id, teacher name or None). New browsers get an id cookie so they only see their own jobs."""
+        c = self.cookies()
+        vid = c.get("hw_id") if re.fullmatch(r"[0-9a-f]{32}", c.get("hw_id", "")) else None
+        self.new_cookies = [] if vid else [f"hw_id={(vid := secrets.token_hex(16))}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"]
+        return vid, session_teacher(c.get("hw_teacher"))
+
+    def send(self, code, body, ctype="text/html; charset=utf-8", loc=None, cookies=()):
         b = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         if loc:
             self.send_header("Location", loc)
-        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(b))); self.end_headers()
+        for c in list(getattr(self, "new_cookies", [])) + list(cookies):
+            self.send_header("Set-Cookie", c)
+        self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(b)))
+        self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
         self.wfile.write(b)
 
+    def job(self, jid, teacher):
+        """A job is reachable by its unguessable link; teacher-mode jobs only by signed-in teachers."""
+        if not re.fullmatch(r"[0-9a-f]{12,32}", jid) or not os.path.exists(jpath(jid)):
+            return None
+        st = load(jid)
+        return st if (is_student(st) or teacher) else None
+
     def do_GET(self):
+        vid, teacher = self.who()
         p = self.path.split("?")[0]
         if p == "/":
-            return self.send(200, home())
-        m = re.match(r"^/job/([0-9a-f]{12})(\.json)?$", p)
-        if m and os.path.exists(jpath(m.group(1))):
-            st = load(m.group(1))
+            return self.send(200, home(vid, teacher))
+        m = re.match(r"^/job/([0-9a-f]+)(\.json)?$", p)
+        st = self.job(m.group(1), teacher) if m else None
+        if st:
             return self.send(200, json.dumps(st, indent=1), "application/json") if m.group(2) else self.send(200, report(st))
         self.send(404, page("Not found", "<p>Not found. <a href='/'>Home</a></p>"))
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length", 0))
-        form = urllib.parse.parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
+        vid, teacher = self.who()
+        n = min(int(self.headers.get("Content-Length", 0)), 400_000)
+        form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
+        f = lambda k, d="": form.get(k, [d])[0]
+        if self.path == "/teacher":
+            name = teacher_for_key(f("key"))
+            if not name:
+                time.sleep(1.5)   # slows down guessing
+                return self.send(403, home(vid, None, "That teacher key is not valid."))
+            return self.send(303, "", loc="/", cookies=[f"hw_teacher={make_session(name)}; Path=/; Max-Age={SESSION_DAYS * 86400}; HttpOnly; SameSite=Lax"])
+        if self.path == "/teacher/logout":
+            return self.send(303, "", loc="/", cookies=["hw_teacher=; Path=/; Max-Age=0"])
         if self.path == "/new":
-            text = form.get("text", [""])[0].replace("\r\n", "\n").strip()
+            text = f("text").replace("\r\n", "\n").strip()
             if not text:
-                return self.send(400, "empty")
-            jid = uuid.uuid4().hex[:12]
+                return self.send(400, home(vid, teacher, "Paste your draft first."))
+            mode = "teacher" if teacher and f("mode") == "teacher" else "student"
+            if not teacher and any(s.get("owner") == vid and s["status"] in ("queued", "running") for s in all_jobs()):
+                return self.send(429, home(vid, teacher, "You already have a job waiting or running. Please wait for it to finish."))
+            jid = secrets.token_hex(16)
             os.makedirs(os.path.join(DATA, jid))
-            st = {"id": jid, "title": form.get("title", ["Untitled"])[0][:200], "text": text, "created": time.time(),
-                  "extra": max(0, min(6, int(form.get("extra", ["3"])[0] or 3))), "status": "queued", "step": "sections",
-                  "mode": form.get("mode", [MODES[0]])[0] if form.get("mode", [MODES[0]])[0] in MODES else MODES[0]}
+            try:
+                extra = max(0, min(6, int(f("extra", "3") or 3)))
+            except ValueError:
+                extra = 3
+            st = {"id": jid, "title": f("title", "Untitled")[:200] or "Untitled", "text": text[:60000], "created": time.time(),
+                  "extra": extra, "status": "queued", "step": "sections", "mode": mode, "owner": vid}
             save(st); wake.set()
             return self.send(303, "", loc=f"/job/{jid}")
-        m = re.match(r"^/retry/([0-9a-f]{12})$", self.path)
-        if m and os.path.exists(jpath(m.group(1))):
-            st = load(m.group(1)); st["status"] = "queued"; save(st); wake.set()
-            return self.send(303, "", loc=f"/job/{m.group(1)}")
+        m = re.match(r"^/retry/([0-9a-f]+)$", self.path)
+        st = self.job(m.group(1), teacher) if m else None
+        if st and st["status"] == "error":
+            st["status"] = "queued"; save(st); wake.set()
+            return self.send(303, "", loc=f"/job/{st['id']}")
         self.send(404, "not found")
 
     def log_message(self, *a):
         pass
 
 
-# Public half of the teacher-mode signing key (RSA-3072, PKCS#1 v1.5, SHA-256). It can only CHECK licences;
-# making one needs the private key, which only the author holds.
-TEACHER_PUBKEY_N = int(
-    "c684239c46a9a05fd03416e03dbfeb6a56d5c67a0d491bf183027d21bf9d5851c8c2154a64af3651ee20dcd03afeedf5"
-    "d16935a45dfc32711034946a120cb806a1ebc696cec726710cb87a865fb9d4c0e4a1cbfa8815f7ebc16d2a466c8172f6"
-    "4eac46a9032bf534e564f153e2b196fb23434a97ebc84e54b6f63e65642f9ebf66c6c3a0b41b7d611d4ed2c5f5f5ac98"
-    "169e5c20db84f0d2eeb79584a66a8febeb4821ca7c4a98281e71b33d9438ffe516e7ca33fb89642b27ef7c04eb6dc093"
-    "9558cd485b11c5d3414139093e1cb0533462d2142b8de60519728b534622ddf55ea8ea649fae8ed1fe9d0dfba79520f0"
-    "4fe96a13b098221c0209647cc606de50cb306682debc78ac64ad3f1b87908eece69c8ee4954d0e53e45d752a2745a467"
-    "7e198f25c8b4365588abef0f0a52cd326589867d03e72cd7a9c1c88a57b316cc757fcb48ac7b8a5add53de1d581c0132"
-    "22eca66ece611b31956394d57f6dd872c62a59faeabcc8109eac3c0b9511e4bd6355964282f196efec4c1dab57644759"
-    , 16)
-LICENCE_RE = re.compile(r"^LICENCE = (\{.*\})\s*$", re.M)
-
-def rsa_verify(payload, sig_hex):
-    n = TEACHER_PUBKEY_N; k = (n.bit_length() + 7) // 8
-    try:
-        sig = int(sig_hex, 16)
-    except (TypeError, ValueError):
-        return False
-    if not 0 < sig < n:
-        return False
-    info = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(payload).digest()
-    expected = b"\x00\x01" + b"\xff" * (k - len(info) - 3) + b"\x00" + info
-    return hmac.compare_digest(pow(sig, 65537, n).to_bytes(k, "big"), expected)
-
-def check_licence(source):
-    """teacher_mode.py ends with a signed LICENCE line. The signature covers the licensee, the expiry date and a hash
-    of the rest of the file, so it can't be forged, moved to another file, or kept after the file is edited."""
-    m = LICENCE_RE.search(source)
-    if not m:
-        return None, "no licence in teacher_mode.py"
-    try:
-        lic = json.loads(m.group(1))
-    except ValueError:
-        return None, "unreadable licence"
-    code_hash = hashlib.sha256(LICENCE_RE.sub("", source).encode()).hexdigest()
-    payload = f"homework-wizard-teacher-v1\n{lic.get('to', '')}\n{lic.get('expires', '')}\n{code_hash}".encode()
-    if not rsa_verify(payload, lic.get("sig", "")):
-        return None, "licence signature is not valid (wrong key, or the file was changed)"
-    if lic.get("expires") and time.strftime("%Y-%m-%d") > lic["expires"]:
-        return None, f"licence expired on {lic['expires']}"
-    return lic, ""
-
-def load_addon():
-    """If a licensed teacher_mode.py sits next to this file, offer its modes (first = default) next to student mode.
-    The optional MODES environment variable (e.g. MODES=student) limits or reorders what is offered."""
-    global ADDON, MODES, LICENSEE
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "teacher_mode.py")
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as f:
-        lic, why = check_licence(f.read())
-    if not lic:
-        print(f"teacher_mode.py ignored: {why}", flush=True)
-        return
-    sys.path.insert(0, here)
-    ADDON = importlib.import_module("teacher_mode")
-    ADDON.setup(sys.modules[__name__])
-    LICENSEE = lic["to"] + (f" (until {lic['expires']})" if lic.get("expires") else "")
-    offered = ADDON.MODES + ["student"]
-    wanted = [m for m in os.environ.get("MODES", "").split(",") if m in offered]
-    MODES = wanted or offered
-    print(f"teacher mode licensed to {LICENSEE}: modes " + ", ".join(MODES), flush=True)
-
 if __name__ == "__main__":
-    load_addon()
+    if sys.argv[1:2] == ["teacher-key"]:
+        teacher_key_cli(sys.argv[2:])
+        sys.exit()
     os.makedirs(DATA, exist_ok=True)
+    print(f"Homework Wizard on port {PORT}; {len(read_keys())} teacher key(s) in {KEYS}", flush=True)
     threading.Thread(target=worker, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 jobs/
-teacher_mode.py
+data/
+teachers.json
+secret.key
