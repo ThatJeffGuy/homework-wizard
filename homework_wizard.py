@@ -4,8 +4,8 @@
 It checks work, it does not write it: every suggestion is a pointer (what to look into, which source says so),
 never text that could be pasted in.
 
-Teacher mode also drafts sourced additions and new sections. Only signed-in teachers get it: the school creates a key
-per teacher with  python3 homework_wizard.py teacher-key add "Name"  (see README).
+Teacher mode also drafts sourced additions and new sections. Only teachers who log in get it: the school adds
+teachers (email + password) with  python3 add_teacher.py  (see README).
 
 Made by That Scottish Guy (https://www.everydaysciencestuff.com) - MIT licence, see LICENSE.
 
@@ -31,7 +31,7 @@ STEPS = ["sections", "claims", "research", "verdicts", "newsections", "additions
 
 wake = threading.Event()
 _base = os.path.dirname(os.path.abspath(DATA))
-KEYS = os.environ.get("KEYS_FILE", os.path.join(_base, "teachers.json"))       # hashed teacher keys
+KEYS = os.environ.get("TEACHERS_FILE", os.path.join(_base, "teachers.json"))  # teacher logins (hashed passwords)
 SECRET_FILE = os.environ.get("SECRET_FILE", os.path.join(_base, "secret.key"))  # signs teacher sessions
 SESSION_DAYS = 30
 
@@ -379,7 +379,11 @@ def teacher_additions(st, s, ev, notes, numbered):
     log(st, f"additions for '{s['title']}': {len(s['additions'])}")
 
 
-# ---------- teacher keys + sessions ----------
+# ---------- teacher logins + sessions ----------
+PBKDF2_ROUNDS = 600_000
+MIN_PASSWORD = 10
+failed = {}   # ip -> [failure times], for slowing down password guessing
+
 def read_keys():
     try:
         with open(KEYS) as f:
@@ -394,15 +398,31 @@ def write_keys(keys):
     os.chmod(KEYS + ".tmp", 0o600)
     os.replace(KEYS + ".tmp", KEYS)
 
-def key_hash(key):
-    return hashlib.sha256(("homework-wizard-teacher:" + key.strip()).encode()).hexdigest()
+def norm_email(email):
+    return email.strip().lower()
 
-def teacher_for_key(key):
-    h = key_hash(key)
-    for name, rec in read_keys().items():
-        if hmac.compare_digest(rec["hash"], h):
-            return name
-    return None
+def hash_password(password, salt, rounds=PBKDF2_ROUNDS):
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), rounds).hex()
+
+def set_teacher(email, password):
+    keys = read_keys()
+    salt = secrets.token_hex(16)
+    keys[norm_email(email)] = {"salt": salt, "rounds": PBKDF2_ROUNDS, "hash": hash_password(password, salt),
+                               "created": time.strftime("%Y-%m-%d")}
+    write_keys(keys)
+
+def check_login(email, password):
+    """Email of the teacher if the password matches, else None (same work either way, so timing reveals nothing)."""
+    rec = read_keys().get(norm_email(email))
+    salt = rec.get("salt", "00" * 16) if rec else "00" * 16
+    rounds = rec.get("rounds", PBKDF2_ROUNDS) if rec else PBKDF2_ROUNDS
+    ok = hmac.compare_digest(hash_password(password, salt, rounds), rec.get("hash", "") if rec else "")
+    return norm_email(email) if (rec and ok) else None
+
+def login_blocked(ip):
+    now = time.time()
+    failed[ip] = [t for t in failed.get(ip, []) if now - t < 900]
+    return len(failed[ip]) >= 10
 
 def server_secret():
     os.makedirs(os.path.dirname(SECRET_FILE) or ".", exist_ok=True)
@@ -429,28 +449,6 @@ def session_teacher(cookie):
         return None
     name = urllib.parse.unquote(qname)
     return name if int(exp) > time.time() and name in read_keys() else None
-
-def teacher_key_cli(args):
-    usage = ('usage: homework_wizard.py teacher-key add "Name" | remove "Name" | list\n'
-             f"(keys file: {KEYS}; set DATA_DIR / KEYS_FILE the same way as for the server)")
-    keys = read_keys()
-    if args[:1] == ["add"] and len(args) == 2:
-        name = args[1].strip()
-        if not name or name in keys:
-            sys.exit(f"'{name}' already has a key; remove it first to make a new one." if name else usage)
-        key = "-".join(secrets.token_hex(3).upper() for _ in range(5))   # 120 random bits
-        keys[name] = {"hash": key_hash(key), "created": time.strftime("%Y-%m-%d")}
-        write_keys(keys)
-        print(f"Teacher key for {name} (shown only once, give it to them privately):\n\n    {key}\n")
-    elif args[:1] == ["remove"] and len(args) == 2:
-        if keys.pop(args[1].strip(), None) is None:
-            sys.exit(f"no key for '{args[1]}'")
-        write_keys(keys); print(f"removed {args[1]} (their sessions end too)")
-    elif args == ["list"]:
-        print("\n".join(f"{n}  (created {r['created']})" for n, r in sorted(keys.items())) or "no teacher keys yet")
-    else:
-        sys.exit(usage)
-
 
 # ---------- web ----------
 CSS = """
@@ -514,12 +512,13 @@ def home(viewer, teacher, msg=""):
     mode_pick = ("<select name=mode><option value=teacher>Teacher: draft sourced additions</option>"
                  "<option value=student>Student: check and coach</option></select>") if teacher else ""
     if teacher:
-        who = (f"<p class=mut>Signed in as teacher: <b>{e(teacher)}</b> · <form method=post action=/teacher/logout "
-               f"style=display:inline><button class=link>sign out</button></form></p>")
+        who = (f"<p class=mut>Logged in as teacher: <b>{e(teacher)}</b> · <form method=post action=/teacher/logout "
+               f"style=display:inline><button class=link>log out</button></form></p>")
     else:
-        who = ("<details class=teacher><summary class=mut>Teacher? Sign in with your key</summary>"
-               "<form method=post action=/teacher class=card><input name=key type=password autocomplete=off "
-               "placeholder='Teacher key' required><button>Sign in</button></form></details>")
+        who = ("<details class=teacher><summary class=mut>Teacher login</summary>"
+               "<form method=post action=/teacher class=card><input name=email type=email autocomplete=username "
+               "placeholder='Email' required><input name=password type=password autocomplete=current-password "
+               "placeholder='Password' required><button>Log in</button></form></details>")
     return page("Homework Wizard", f"""<h1>Homework Wizard</h1>
 <p class=mut>Paste your own draft. A local model checks every claim against web sources and tells you what
 holds up, what to fix and what could make it stronger, with the sources to read. It checks your work; it does not
@@ -673,10 +672,14 @@ class H(BaseHTTPRequestHandler):
         form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
         f = lambda k, d="": form.get(k, [d])[0]
         if self.path == "/teacher":
-            name = teacher_for_key(f("key"))
+            ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
+            if login_blocked(ip):
+                return self.send(429, home(vid, None, "Too many failed logins. Try again in 15 minutes."))
+            name = check_login(f("email"), f("password"))
             if not name:
-                time.sleep(1.5)   # slows down guessing
-                return self.send(403, home(vid, None, "That teacher key is not valid."))
+                failed.setdefault(ip, []).append(time.time()); time.sleep(1.5)
+                return self.send(403, home(vid, None, "Wrong email or password."))
+            failed.pop(ip, None)
             return self.send(303, "", loc="/", cookies=[f"hw_teacher={make_session(name)}; Path=/; Max-Age={SESSION_DAYS * 86400}; HttpOnly; SameSite=Lax"])
         if self.path == "/teacher/logout":
             return self.send(303, "", loc="/", cookies=["hw_teacher=; Path=/; Max-Age=0"])
@@ -709,10 +712,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["teacher-key"]:
-        teacher_key_cli(sys.argv[2:])
-        sys.exit()
     os.makedirs(DATA, exist_ok=True)
-    print(f"Homework Wizard on port {PORT}; {len(read_keys())} teacher key(s) in {KEYS}", flush=True)
+    print(f"Homework Wizard on port {PORT}; {len(read_keys())} teacher login(s) in {KEYS}", flush=True)
     threading.Thread(target=worker, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

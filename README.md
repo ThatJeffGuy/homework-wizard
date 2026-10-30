@@ -21,19 +21,21 @@ students, no paid API, no student data sent to an AI company.
   A student can have one job waiting at a time.
 
 ## Teacher mode
-Teachers sign in with a personal **teacher key** (a box at the bottom of the page). Teacher mode also drafts sourced
-additions and new sections in the writer's voice as tick-box suggestions, and **Build final text** assembles the draft,
-the ticked parts and a source list. Handy for model answers, worksheets and the teacher's own writing.
-Teacher-mode jobs are only visible to signed-in teachers; students never see the option.
+Anyone who isn't logged in uses student mode. Teachers log in with their email and password (the **Teacher login**
+box at the bottom of the page) and get teacher mode as well: it also drafts sourced additions and new sections in the
+writer's voice as tick-box suggestions, and **Build final text** assembles the draft, the ticked parts and a source
+list. Handy for model answers, worksheets and the teacher's own writing. Teacher-mode jobs are only visible to
+logged-in teachers; students never see the option.
 
-The school creates the keys on the server:
+The school adds teachers on the server:
 ```
-python3 homework_wizard.py teacher-key add "Ms Smith"      # prints a new key once; give it to her privately
-python3 homework_wizard.py teacher-key list
-python3 homework_wizard.py teacher-key remove "Ms Smith"   # also signs her out everywhere
+python3 add_teacher.py                  # asks for email, password and confirm password (also changes a password)
+python3 add_teacher.py --list
+python3 add_teacher.py --remove ms.smith@school.example   # also logs her out everywhere
 ```
-Run these with the same `DATA_DIR` (or `KEYS_FILE`) as the server. Only a hash of each key is stored
-(`teachers.json`), and sign-ins last 30 days. Keys are 120-bit random and wrong guesses are slowed down.
+Run it with the same `DATA_DIR` (or `TEACHERS_FILE`) as the server. Passwords are stored salted and hashed
+(PBKDF2-SHA256, 600,000 rounds) in `teachers.json`, logins last 30 days, and after 10 wrong passwords an address is
+blocked for 15 minutes.
 
 ## Requirements
 - Python 3.10+ (standard library only, nothing to `pip install`)
@@ -49,7 +51,7 @@ git clone https://github.com/ThatJeffGuy/homework-wizard
 cd homework-wizard
 ollama pull glm-4.7-flash:q4_K_M
 DATA_DIR=./data/jobs python3 homework_wizard.py     # then open http://localhost:8501
-DATA_DIR=./data/jobs python3 homework_wizard.py teacher-key add "Your Name"
+DATA_DIR=./data/jobs python3 add_teacher.py
 ```
 
 Settings (environment variables):
@@ -60,15 +62,15 @@ Settings (environment variables):
 | `LLM_MODEL` | `glm-4.7-flash:q4_K_M` | any Ollama model |
 | `SEARX_URL` | `http://127.0.0.1:8080/search` | SearXNG search endpoint |
 | `DATA_DIR` | `/var/lib/homework-wizard/jobs` | where jobs are saved |
-| `KEYS_FILE` | `teachers.json` next to `DATA_DIR` | hashed teacher keys |
-| `SECRET_FILE` | `secret.key` next to `DATA_DIR` | signs teacher sign-ins (created automatically) |
+| `TEACHERS_FILE` | `teachers.json` next to `DATA_DIR` | teacher logins (hashed passwords) |
+| `SECRET_FILE` | `secret.key` next to `DATA_DIR` | signs teacher logins (created automatically) |
 | `PORT` | `8501` | web port |
 | `THREADS` | Ollama's choice | CPU threads for the model (on CPU-only setups, roughly your physical core count) |
 
 `homework-wizard.service` is an example systemd unit, and `ollama-cpu.service` an example of a second, CPU-only Ollama
 instance, handy if your GPU is busy with something else.
 
-**Security:** students need no login. Serve it over HTTPS behind your school's reverse proxy (teacher sign-ins use a
+**Security:** students need no login. Serve it over HTTPS behind your school's reverse proxy (teacher logins use a
 cookie), and keep it on the school network or behind your usual single sign-on if it faces the internet.
 
 ## Honest limits
@@ -76,8 +78,8 @@ cookie), and keep it on the school network or behind your usual single sign-on i
   not the final word, and read the sources.
 - Sources that repeat the draft itself (say, a copy already published online) are skipped, since a text can't confirm itself.
 - Search quality decides fact-check quality. Very new or very niche topics come back "unclear".
-- The code is open source: someone running their own copy can make their own teacher key. Teacher keys protect the
-  school's server, where students can't get teacher mode.
+- Teacher logins protect the school's server. The code is open source, so anyone running their own copy can add
+  their own teacher login; it's built for schools, but people are free to use it however they like.
 
 ## Licence
 MIT, © 2026 [That Scottish Guy](https://www.everydaysciencestuff.com). Keep the copyright notice (credit) when you reuse it.
