@@ -34,6 +34,8 @@ _base = os.path.dirname(os.path.abspath(DATA))
 KEYS = os.environ.get("TEACHERS_FILE", os.path.join(_base, "teachers.json"))  # teacher logins (hashed passwords)
 SECRET_FILE = os.environ.get("SECRET_FILE", os.path.join(_base, "secret.key"))  # signs teacher sessions
 SESSION_DAYS = 30
+STUDENTS_FILE = os.path.join(_base, "students.json")   # hint balance per browser
+SETTINGS_FILE = os.path.join(_base, "settings.json")   # teacher-adjustable settings
 
 
 # ---------- storage ----------
@@ -327,6 +329,7 @@ def run_job(jid):
             {"sections": step_sections, "claims": step_claims, "research": step_research, "verdicts": step_verdicts,
              "newsections": step_newsections, "additions": step_additions}[st["step"]](st)
             st["step"] = STEPS[STEPS.index(st["step"]) + 1]; save(st)
+        award_hint(st)
         st["status"] = "done"; st["finished"] = time.time()
         log(st, f"finished in {round((st['finished'] - st['created']) / 60)} min")
     except Exception as e:
@@ -459,6 +462,89 @@ def session_teacher(cookie):
     name = urllib.parse.unquote(qname)
     return name if int(exp) > time.time() and name in read_keys() else None
 
+
+# ---------- hints: earned by good scores, spent on a highlighted part of a marked paper ----------
+MAX_HINTS = 3
+file_lock = threading.Lock()
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f, indent=1)
+    os.chmod(path + ".tmp", 0o600)
+    os.replace(path + ".tmp", path)
+
+def settings():
+    cfg = {"hint_score": 80, "start_hints": 1}
+    cfg.update(read_json(SETTINGS_FILE, {}))
+    return cfg
+
+def hints_left(viewer):
+    rec = read_json(STUDENTS_FILE, {}).get(viewer or "", {})
+    return rec.get("hints", min(MAX_HINTS, settings()["start_hints"]))
+
+def change_hints(viewer, delta):
+    """Add (or spend, with a negative delta) hints; returns the new balance, or None if there is nothing to spend."""
+    with file_lock:
+        students = read_json(STUDENTS_FILE, {})
+        rec = students.setdefault(viewer, {})
+        have = rec.get("hints", min(MAX_HINTS, settings()["start_hints"]))
+        if have + delta < 0:
+            return None
+        rec["hints"] = min(MAX_HINTS, have + delta)
+        write_json(STUDENTS_FILE, students)
+        return rec["hints"]
+
+def score(st):
+    claims = [c for s in st.get("sections", []) for c in s.get("claims", []) if "verdict" in c]
+    return round(100 * sum(c["verdict"] == "supported" for c in claims) / len(claims)) if claims else None
+
+def award_hint(st):
+    """A marked student paper scoring at least the teacher's threshold earns one hint (once per paper)."""
+    pct, need = score(st), settings()["hint_score"]
+    if not is_student(st) or not st.get("owner") or pct is None or st.get("hint_award"):
+        return
+    if pct >= need:
+        before = hints_left(st["owner"])
+        after = change_hints(st["owner"], +1)
+        st["hint_award"] = {"score": pct, "earned": after > before}
+    else:
+        st["hint_award"] = {"score": pct, "earned": False, "needed": need}
+
+def make_hint(jid, hid):
+    with file_lock:
+        st = load(jid)
+    h = st["hints"][hid]
+    si = int(h["k"][1:].split("_")[0]); pi = int(h["k"].split("_")[1])
+    sec = st["sections"][si]
+    ev = sec.get("add_evidence") or [x for c in sec.get("claims", []) for x in c.get("evidence", [])][:8]
+    notes = "\n".join(f"- {c['claim']} => {c.get('verdict')}: {c.get('note', '')}" for c in sec.get("claims", []))
+    try:
+        text = llm([{"role": "system", "content": SYS_STUDENT}, {"role": "user", "content":
+            "The student highlighted part of their own homework and asked for a hint.\n"
+            f"HIGHLIGHTED: \"{h['text']}\"\nIN THIS PARAGRAPH: {sec['paras'][pi - 1]}\n\n"
+            "Give ONE hint of 1 to 3 sentences, written to the student. Point them in the right direction: a guiding "
+            "question, what to double-check, or what to look for, and which source to read, cited like [2]. Do NOT give "
+            "the answer, do NOT correct it for them and do NOT rewrite their words. If the highlighted part already "
+            "looks right, say so and hint at how to back it up or explain it better.\n\n"
+            "MARKING SHEET FOR THIS SECTION:\n" + (notes or "(none)") + "\n\nEVIDENCE:\n" + evidence_block(ev)}],
+            temp=0.4, max_tokens=300)
+        status = "done"
+    except Exception as ex:
+        text, status = f"The hint could not be made ({ex.__class__.__name__}); your hint was given back.", "error"
+        change_hints(st["owner"], +1)
+    with file_lock:
+        st = load(jid)
+        st["hints"][hid].update(answer=text, status=status, evidence=ev)
+        save(st)
+
 # ---------- web ----------
 CSS = """
 :root{--paper:#fdfcf6;--ink:#1f2a44;--mut:#5b6377;--rule:#d6e4f2;--margin:#f0a8a8;--card:#fff;--line:#d9dce3;
@@ -525,10 +611,13 @@ FOOTER = (f"<footer><b>Made by <a href='https://www.everydaysciencestuff.com' ta
           f" · &copy; 2026 · <a href='{REPO}/blob/main/LICENSE' target=_blank rel=noopener>MIT</a>"
           f" · <a href='{REPO}' target=_blank rel=noopener>Source on GitHub</a></footer>")
 
-def page(title, body, refresh=False):
-    meta = '<meta http-equiv="refresh" content="15">' if refresh else ""
+def page(title, body, refresh=False, side=""):
+    # reload every 15 s while work is in progress, but never while a drawer is open or text is highlighted
+    again = ("<script>setInterval(()=>{if(!document.querySelector('.side.open')&&!document.hidden&&!getSelection().toString())"
+             "location.reload()},15000)</script>") if refresh else ""
     return (f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"{meta}<title>{html.escape(title)}</title><style>{CSS}</style></head><body><div class=wrap>{body}{FOOTER}</div></body></html>")
+            f"<title>{html.escape(title)}</title><style>{CSS}{DRAWER_CSS}</style></head><body><div class=wrap>{body}{FOOTER}</div>"
+            f"{side}{again}</body></html>")
 
 def e(s):
     return html.escape(str(s or ""))
@@ -547,6 +636,230 @@ HAT = ("<svg viewBox='0 0 64 64' aria-hidden=true><path d='M6 52Q32 43 58 52Q32 
        "<path d='M14 50L33 7Q37 3 38 9L47 49Q30 44 14 50Z' fill='currentColor'/>"
        "<path d='M27 27l2.2 4.4 4.8.7-3.5 3.4.8 4.8-4.3-2.3-4.3 2.3.8-4.8-3.5-3.4 4.8-.7z' fill='#ffcd3c'/>"
        "<circle cx='38' cy='19' r='2.2' fill='#ffcd3c'/><circle cx='22' cy='44' r='1.6' fill='#ffcd3c'/></svg>")
+
+
+# ---------- side drawers: student tools (left) and staff room (right) ----------
+DRAWER_CSS = """
+:root{--side-w:min(390px,92vw)}
+.side{position:fixed;top:0;bottom:0;width:var(--side-w);z-index:45;overflow-y:auto;padding:22px 20px 48px;
+ background:var(--card);box-shadow:0 0 34px rgba(0,0,0,.28);visibility:hidden;
+ transition:transform .45s cubic-bezier(.2,.8,.2,1),visibility 0s .45s}
+.side.left{left:0;transform:translateX(-102%);border-right:3px solid var(--pencil-edge)}
+.side.right{right:0;transform:translateX(102%);border-left:3px solid var(--pen)}
+.side.open{visibility:visible;transform:none;transition:transform .45s cubic-bezier(.2,.8,.2,1)}
+.side h2{margin:.2em 0 .3em;padding:0;border:0}.side h3{font-size:1.05rem;margin:0}
+button.side-tab{position:fixed;top:50%;z-index:46;display:flex;flex-direction:column;align-items:center;gap:12px;
+ padding:18px 9px;border:0;font:700 11px/1 system-ui,sans-serif;letter-spacing:.24em;text-transform:uppercase;opacity:.9;
+ box-shadow:0 4px 14px rgba(0,0,0,.22);transition:left .45s cubic-bezier(.2,.8,.2,1),right .45s cubic-bezier(.2,.8,.2,1),opacity .2s,padding .2s}
+button.side-tab:hover{opacity:1}button.side-tab:active{transform:translateY(-50%)}
+.side-tab .tab-txt{writing-mode:vertical-rl}
+.side-tab .tab-arrow{width:9px;height:9px;border:0 solid currentColor;border-width:0 0 2.5px 2.5px;flex:none;transition:transform .4s}
+button.side-tab.right{right:0;transform:translateY(-50%);border-radius:12px 0 0 12px;background:var(--pen);color:#fff}
+button.side-tab.left{left:0;transform:translateY(-50%);border-radius:0 12px 12px 0;background:var(--pencil);color:#2b2100}
+.side-tab.left .tab-txt{transform:rotate(180deg)}
+.side-tab.right .tab-arrow{transform:rotate(45deg)}.side-tab.left .tab-arrow{transform:rotate(-135deg)}
+.side.open+.side-tab.right{right:var(--side-w)}.side.open+.side-tab.left{left:var(--side-w)}
+.side.open+.side-tab.right .tab-arrow{transform:rotate(-135deg)}.side.open+.side-tab.left .tab-arrow{transform:rotate(45deg)}
+.side-tab.right:hover{padding-right:14px}.side-tab.left:hover{padding-left:14px}
+.tool{border:1px solid var(--line);border-radius:6px;margin:10px 0;background:var(--paper)}
+.tool>summary{padding:9px 12px;font-weight:700}.tool>div{padding:0 12px 12px}
+.tool label{display:block;font-size:.85rem;color:var(--mut);margin-top:6px}.tool input,.tool select,.tool textarea{padding:7px 9px}
+.tool textarea{min-height:110px}.tool button{padding:6px 14px;margin-top:8px}
+.tool .out{background:var(--card);border:1px dashed var(--line);border-radius:4px;padding:8px 10px;margin-top:8px;font-size:.92rem;word-break:break-word}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:.92rem}.kv b{font-weight:600}
+.checks label{display:flex;gap:8px;align-items:flex-start;color:var(--ink);font-size:.93rem}.checks input{width:auto;margin-top:5px}
+.timer{font:700 2.4rem/1.1 ui-monospace,monospace;text-align:center;margin:6px 0}
+.cv{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.star{color:var(--pencil-edge);font-size:1.2rem;letter-spacing:.1em}.star.off{color:var(--line)}
+.hintbox{background:var(--paper)}.hintbox p{margin:.3em 0}
+#hintbar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:40;display:none;max-width:92vw;
+ background:var(--card);border:2px solid var(--ink);border-radius:10px;padding:8px 10px 8px 14px;box-shadow:0 6px 20px rgba(0,0,0,.25);
+ align-items:center;gap:12px}#hintbar.show{display:flex}#hintbar span{font-size:.9rem}#hintbar button{flex:none}
+.hint{background:#ffe0b2;color:#3b2a10}.hint q{font-style:italic}
+@media (prefers-reduced-motion:reduce){.side,.side.open,button.side-tab{transition:none}}
+"""
+
+def student_panel(viewer):
+    left, cfg = hints_left(viewer), settings()
+    stars = "".join("<span class=star>★</span>" if i < left else "<span class='star off'>☆</span>" for i in range(MAX_HINTS))
+    wallet = (f"<div class='card hintbox'><h3>Your hints {stars}</h3><p><b>{left} of {MAX_HINTS}</b> left.</p>"
+              "<p class=mut>On a marked paper, highlight a part of your own writing and tap <b>Get a hint</b>. "
+              "A hint points you in the right direction; it never gives you the answer.</p>"
+              f"<p class=mut>Score <b>{cfg['hint_score']}%</b> or more on a marked paper to earn another hint "
+              f"(you can hold up to {MAX_HINTS}).</p></div>")
+    return """<aside class="side left" id=side-student aria-label="Cheat sheet" aria-hidden=true>
+<h2>Cheat Sheet</h2><p class=mut>The legal kind.</p>""" + wallet + STUDENT_TOOLS
+
+STUDENT_TOOLS = """<p class=mut>The tools below run in your own browser. Nothing you type in them is sent anywhere.</p>
+
+<details class=tool open><summary>Draft check</summary><div>
+<p class=mut id=dc-src>Checks the draft in the big box as you type.</p>
+<textarea id=dc-text placeholder="Paste text here to check it" hidden></textarea>
+<div class="out kv" id=dc-out></div></div></details>
+
+<details class=tool><summary>Citation maker</summary><div>
+<label>Style <select id=ci-style><option value=apa>APA 7</option><option value=mla>MLA 9</option></select></label>
+<label>Author(s): Last, First; separate several with ; <input id=ci-author placeholder="Smith, Jane; Lee, Sam"></label>
+<label>Title of the page or article <input id=ci-title></label>
+<label>Website or publisher <input id=ci-site placeholder="National Geographic"></label>
+<label>Date published <input id=ci-date type=date></label>
+<label>Link (URL) <input id=ci-url type=url placeholder="https://"></label>
+<label>Date you read it (MLA) <input id=ci-acc type=date></label>
+<div class=out id=ci-out>Fill in what you know; leave the rest empty.</div><button type=button id=ci-copy>Copy citation</button></div></details>
+
+<details class=tool><summary>Before you hand it in</summary><div class=checks id=hk>
+<label><input type=checkbox>My main point is clear in the first paragraph.</label>
+<label><input type=checkbox>Every fact, date and number has a source.</label>
+<label><input type=checkbox>I explained things in my own words.</label>
+<label><input type=checkbox>Each paragraph sticks to one idea.</label>
+<label><input type=checkbox>I fixed what the marking sheet flagged.</label>
+<label><input type=checkbox>I read it out loud once to catch mistakes.</label>
+<label><input type=checkbox>Names, spelling and numbers are checked.</label>
+<label><input type=checkbox>My sources list is at the end.</label>
+<button type=button id=hk-reset class=link>Clear the ticks</button></div></details>
+
+<details class=tool><summary>Unit converter</summary><div>
+<label>What <select id=uc-kind></select></label>
+<div class=cv><label>From <select id=uc-from></select></label><label>To <select id=uc-to></select></label></div>
+<label>Amount <input id=uc-val type=number step=any value=1></label>
+<div class=out id=uc-out></div></div></details>
+
+<details class=tool><summary>Study timer</summary><div>
+<div class=timer id=st-show>25:00</div><p class="mut" id=st-mode style=text-align:center>Focus: 25 minutes, then a 5 minute break.</p>
+<div class=row><button type=button id=st-go>Start</button><button type=button id=st-reset class=link>Reset</button></div></div></details>
+</aside>
+<button class="side-tab left" type=button aria-controls=side-student aria-expanded=false aria-label="Open the cheat sheet">
+<span class=tab-arrow aria-hidden=true></span><span class=tab-txt>Cheat Sheet</span><span class=tab-arrow aria-hidden=true></span></button>"""
+
+DRAWER_JS = r"""<script>
+(()=>{
+const $=id=>document.getElementById(id);
+const store={get(k,d){try{const v=localStorage.getItem('hw-'+k);return v===null?d:JSON.parse(v)}catch(e){return d}},
+  set(k,v){try{localStorage.setItem('hw-'+k,JSON.stringify(v))}catch(e){}}};
+// drawers
+function setOpen(p,open){const t=document.querySelector(`[aria-controls="${p.id}"]`);p.classList.toggle('open',open);
+  p.setAttribute('aria-hidden',!open);if(t)t.setAttribute('aria-expanded',open);}
+document.querySelectorAll('.side-tab').forEach(t=>t.addEventListener('click',()=>{const p=$(t.getAttribute('aria-controls'));
+  const open=!p.classList.contains('open');document.querySelectorAll('.side.open').forEach(o=>setOpen(o,false));setOpen(p,open);}));
+document.addEventListener('keydown',ev=>{if(ev.key==='Escape')document.querySelectorAll('.side.open').forEach(o=>setOpen(o,false))});
+document.querySelectorAll('.side[data-open]').forEach(p=>setOpen(p,true));
+// draft check
+const main=document.querySelector('form textarea[name=text]'),own=$('dc-text');
+if(!main){own.hidden=false;$('dc-src').textContent='Paste any text to check it.'}
+const stop=new Set('the a an and or but of to in on at for with is are was were be been it its this that these those as by from i you he she we they my your his her our their not no so if then than there here what which who when where how all any can could would should will just also into about over more most very much such do does did have has had me him them us'.split(' '));
+const syl=w=>{w=w.toLowerCase().replace(/[^a-z]/g,'');if(w.length<=3)return 1;w=w.replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/,'').replace(/^y/,'');const m=w.match(/[aeiouy]{1,2}/g);return m?m.length:1};
+function draftCheck(){const t=(main||own).value.trim(),out=$('dc-out');
+  if(!t){out.innerHTML='<span class=mut>Nothing to check yet.</span>';return}
+  const words=t.match(/[A-Za-z0-9'’-]+/g)||[],sents=t.split(/(?<=[.!?])\s+/).filter(s=>/[A-Za-z]/.test(s)),paras=t.split(/\n\s*\n/).filter(p=>p.trim());
+  const sy=words.reduce((a,w)=>a+syl(w),0),wps=words.length/Math.max(1,sents.length);
+  const grade=Math.max(1,Math.round(0.39*wps+11.8*sy/Math.max(1,words.length)-15.59));
+  const long=sents.map(s=>[s,(s.match(/[A-Za-z0-9'’-]+/g)||[]).length]).sort((a,b)=>b[1]-a[1])[0]||['',0];
+  const freq={};words.forEach(w=>{w=w.toLowerCase().replace(/[’']s$/,'');if(w.length>3&&!stop.has(w))freq[w]=(freq[w]||0)+1});
+  const top=Object.entries(freq).filter(([,n])=>n>=4).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  out.innerHTML=`<b>Words</b><span>${words.length}</span><b>Sentences</b><span>${sents.length}</span><b>Paragraphs</b><span>${paras.length}</span>`+
+   `<b>Reading time</b><span>about ${Math.max(1,Math.round(words.length/238))} min</span><b>Reading level</b><span>grade ${grade}</span>`+
+   `<b>Avg sentence</b><span>${wps.toFixed(1)} words${wps>25?' (try some shorter ones)':''}</span>`+
+   (long[1]>30?`<b>Longest</b><span>${long[1]} words: “${esc(long[0].slice(0,90))}${long[0].length>90?'…':''}” Could it be two sentences?</span>`:'')+
+   (top.length?`<b>Used a lot</b><span>${top.map(([w,n])=>esc(w)+' ×'+n).join(', ')}</span>`:'');}
+(main||own).addEventListener('input',draftCheck);draftCheck();
+// citation maker
+const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+const mlaMon=['Jan.','Feb.','Mar.','Apr.','May','June','July','Aug.','Sept.','Oct.','Nov.','Dec.'];
+const v=id=>$(id).value.trim(),escH=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function people(style){const a=v('ci-author').split(';').map(s=>s.trim()).filter(Boolean).map(p=>{const[l,f='']=p.split(',').map(s=>s.trim());return{l,f}});
+  if(!a.length)return'';
+  if(style==='apa'){const ini=f=>f.split(/[\s-]+/).filter(Boolean).map(x=>x[0].toUpperCase()+'.').join(' ');
+    const n=a.map(p=>p.f?`${p.l}, ${ini(p.f)}`:p.l);return n.length<2?n[0]:n.length===2?`${n[0]}, & ${n[1]}`:`${n.slice(0,-1).join(', ')}, & ${n[n.length-1]}`;}
+  const first=a[0].f?`${a[0].l}, ${a[0].f}`:a[0].l;return a.length===1?first:a.length===2?`${first}, and ${a[1].f?a[1].f+' ':''}${a[1].l}`:`${first}, et al`;}
+function cite(){const st=v('ci-style')||$('ci-style').value,title=v('ci-title'),site=v('ci-site'),url=v('ci-url'),d=v('ci-date'),acc=v('ci-acc');
+  let html='',text='';const dd=d?new Date(d+'T12:00'):null,ad=acc?new Date(acc+'T12:00'):null,au=people($('ci-style').value);
+  if($('ci-style').value==='apa'){const date=dd?`(${dd.getFullYear()}, ${months[dd.getMonth()]} ${dd.getDate()})`:'(n.d.)';
+    const head=au?`${au}${au.endsWith('.')?'':'.'} ${date}.`:'';
+    html=(au?`${escH(head)} <i>${escH(title)}</i>.`:`<i>${escH(title)}</i>. ${date}.`)+(site?` ${escH(site)}.`:'')+(url?` ${escH(url)}`:'');
+    text=(au?`${head} ${title}.`:`${title}. ${date}.`)+(site?` ${site}.`:'')+(url?` ${url}`:'');}
+  else{const md=x=>`${x.getDate()} ${mlaMon[x.getMonth()]} ${x.getFullYear()}`;
+    const parts=[site?`<i>${escH(site)}</i>`:'',dd?md(dd):'',url?escH(url.replace(/^https?:\/\//,'')):''].filter(Boolean);
+    const tparts=[site,dd?md(dd):'',url.replace(/^https?:\/\//,'')].filter(Boolean);
+    html=(au?escH(au)+'. ':'')+(title?`“${escH(title)}.” `:'')+parts.join(', ')+(parts.length?'.':'')+(ad?` Accessed ${md(ad)}.`:'');
+    text=(au?au+'. ':'')+(title?`“${title}.” `:'')+tparts.join(', ')+(tparts.length?'.':'')+(ad?` Accessed ${md(ad)}.`:'');}
+  $('ci-out').innerHTML=title||site||url?html:'Fill in what you know; leave the rest empty.';$('ci-out').dataset.text=text;}
+['ci-style','ci-author','ci-title','ci-site','ci-date','ci-url','ci-acc'].forEach(id=>$(id).addEventListener('input',cite));
+$('ci-copy').addEventListener('click',()=>{const t=$('ci-out').dataset.text;if(!t)return;
+  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{$('ci-copy').textContent='Copied!';setTimeout(()=>$('ci-copy').textContent='Copy citation',1500)},
+  ()=>{const r=document.createRange();r.selectNodeContents($('ci-out'));getSelection().removeAllRanges();getSelection().addRange(r)});});
+// checklist
+const boxes=[...document.querySelectorAll('#hk input')],saved=store.get('checklist',[]);
+boxes.forEach((b,i)=>{b.checked=!!saved[i];b.addEventListener('change',()=>store.set('checklist',boxes.map(x=>x.checked)))});
+$('hk-reset').addEventListener('click',()=>{boxes.forEach(b=>b.checked=false);store.set('checklist',[])});
+// unit converter
+const U={'Length':{mm:.001,cm:.01,m:1,km:1000,in:.0254,ft:.3048,yd:.9144,mi:1609.344},
+ 'Mass':{mg:1e-6,g:.001,kg:1,t:1000,oz:.028349523125,lb:.45359237},
+ 'Temperature':{'°C':'C','°F':'F','K':'K'},
+ 'Energy':{J:1,kJ:1000,cal:4.184,kcal:4184,Wh:3600,kWh:3.6e6},
+ 'Speed':{'m/s':1,'km/h':1/3.6,mph:.44704,knot:.514444}};
+const kind=$('uc-kind'),from=$('uc-from'),to=$('uc-to');
+kind.innerHTML=Object.keys(U).map(k=>`<option>${k}</option>`).join('');
+function fillUnits(){const ks=Object.keys(U[kind.value]);[from,to].forEach((s,i)=>{s.innerHTML=ks.map(k=>`<option>${k}</option>`).join('');s.selectedIndex=Math.min(i?2:1,ks.length-1)});conv()}
+function conv(){const x=parseFloat($('uc-val').value),u=U[kind.value];if(isNaN(x)){$('uc-out').textContent='';return}let r;
+  if(kind.value==='Temperature'){const c={C:x,F:(x-32)*5/9,K:x-273.15}[u[from.value]];r={C:c,F:c*9/5+32,K:c+273.15}[u[to.value]]}
+  else r=x*u[from.value]/u[to.value];
+  $('uc-out').textContent=`${x} ${from.value} = ${+r.toPrecision(6)} ${to.value}`}
+kind.addEventListener('change',fillUnits);[from,to,$('uc-val')].forEach(e=>e.addEventListener('input',conv));fillUnits();
+// hints: highlight your own text on a marked paper
+const bar=$('hintbar');
+if(bar){const show=()=>{const sel=getSelection(),t=sel.toString().trim();let k=null;
+    if(sel.rangeCount&&t.length>=3&&t.length<=400){const n=sel.getRangeAt(0).commonAncestorContainer;const p=(n.nodeType===1?n:n.parentElement).closest('.orig p[data-k]');if(p)k=p.dataset.k}
+    if(k){bar.classList.add('show');$('hb-text').textContent='“'+(t.length>60?t.slice(0,60)+'…':t)+'”';bar.dataset.k=k;bar.dataset.t=t}
+    else if(!bar.contains(document.activeElement))bar.classList.remove('show')};
+  document.addEventListener('selectionchange',()=>setTimeout(show,0));
+  $('hb-go').addEventListener('click',()=>{$('hb-k').value=bar.dataset.k;$('hb-t').value=bar.dataset.t;$('hb-form').submit()});}
+// study timer (keeps running across page reloads)
+let tick=null;const FOCUS=25*60,BREAK=5*60,baseTitle=document.title;
+function tstate(){return store.get('timer',{mode:'focus',end:0,left:FOCUS})}
+function render(){const s=tstate(),left=s.end?Math.max(0,Math.round((s.end-Date.now())/1000)):s.left;
+  const mm=String(Math.floor(left/60)).padStart(2,'0'),ss=String(left%60).padStart(2,'0');$('st-show').textContent=`${mm}:${ss}`;
+  $('st-mode').textContent=s.mode==='focus'?'Focus time. Phone face down!':'Break time. Stretch, drink some water.';
+  $('st-go').textContent=s.end?'Pause':'Start';document.title=s.end?`${mm}:${ss} · ${baseTitle}`:baseTitle;
+  if(s.end&&left===0){const next=s.mode==='focus'?{mode:'break',end:Date.now()+BREAK*1000,left:BREAK}:{mode:'focus',end:0,left:FOCUS};store.set('timer',next);}}
+function run(){clearInterval(tick);if(tstate().end)tick=setInterval(render,1000);render()}
+$('st-go').addEventListener('click',()=>{const s=tstate();if(s.end){store.set('timer',{...s,end:0,left:Math.max(0,Math.round((s.end-Date.now())/1000))})}
+  else store.set('timer',{...s,end:Date.now()+s.left*1000});run()});
+$('st-reset').addEventListener('click',()=>{store.set('timer',{mode:'focus',end:0,left:FOCUS});run()});run();
+})();
+</script>"""
+
+def teacher_panel(teacher, viewer, open_it=False, msg=""):
+    if not teacher:
+        body = (f"<h2>Staff room</h2><p class=mut>Teachers: log in to unlock teacher mode, which can also draft sourced "
+                "additions and new sections. Students only ever get student mode.</p>"
+                + (f"<div class='card add'><b class=hand>Note:</b> {e(msg)}</div>" if msg else "")
+                + "<form method=post action=/teacher class=card><label class=mut>Email<input name=email type=email "
+                "autocomplete=username required></label><label class=mut>Password<input name=password type=password "
+                "autocomplete=current-password required></label><p><button>Log in</button></p></form>"
+                "<p class=mut>No login yet? Your school adds teachers on the server with <code>add_teacher.py</code>.</p>")
+    else:
+        mine = [s for s in all_jobs() if not is_student(s) and (s.get("owner") == viewer or not s.get("owner"))]
+        rows = "".join(f"<li><a href='/job/{s['id']}'>{e(s['title'])}</a> <span class=mut>· {STATUS.get(s['status'], e(s['status']))}"
+                       f"{f' {progress(s)[0]}%' if s['status'] == 'running' else ''}</span></li>" for s in mine[:20])
+        body = (f"<h2>Staff room</h2><p>Logged in as <b>{e(teacher)}</b></p>"
+                "<form method=post action=/teacher/logout><button>Log out</button></form>"
+                f"<h3 style='margin-top:1.2em'>Your teacher work</h3><ul>{rows or '<li class=mut>None yet.</li>'}</ul>"
+                f"<h3>Student hints</h3><form method=post action=/teacher/settings class=card>"
+                f"<label class=mut>Score needed to earn a hint (%)<input name=hint_score type=number min=0 max=100 value={settings()['hint_score']}></label>"
+                f"<label class=mut>Hints a new student starts with (0-{MAX_HINTS})<input name=start_hints type=number min=0 max={MAX_HINTS} value={settings()['start_hints']}></label>"
+                "<p><button>Save</button></p></form>"
+                "<h3>How teacher mode works</h3><ul class=mut><li>Pick <b>Teacher</b> in the form before handing in.</li>"
+                "<li>You get sourced additions and new sections as tick-box suggestions, then <b>Write out the clean copy</b>.</li>"
+                "<li>Students never see teacher mode, and teacher work only opens while you are logged in.</li>"
+                "<li>Logins last 30 days on this device. 3 wrong passwords lock that address out for 1 hour.</li></ul>")
+    return (f"<aside class='side right' id=side-staff aria-label='Staff room' aria-hidden=true{' data-open' if open_it else ''}>{body}</aside>"
+            "<button class='side-tab right' type=button aria-controls=side-staff aria-expanded=false aria-label='Open the staff room'>"
+            "<span class=tab-arrow aria-hidden=true></span><span class=tab-txt>Staff room</span><span class=tab-arrow aria-hidden=true></span></button>")
+
+def drawers(teacher, viewer, open_staff=False, msg=""):
+    return student_panel(viewer) + teacher_panel(teacher, viewer, open_staff, msg) + DRAWER_JS
+
 STATUS = {"queued": "In the pile", "running": "Being marked…", "done": "Marked ✓", "error": "Lost in the backpack"}
 MARKS = {"supported": "✓ checks out", "partly": "½ partly right", "unclear": "? needs a source", "contradicted": "✗ check this"}
 
@@ -590,7 +903,7 @@ def queue_place(st):
         return 0
     return 1 + sum(1 for s in all_jobs() if s["status"] in ("queued", "running") and s["created"] < st["created"])
 
-def home(viewer, teacher, msg=""):
+def home(viewer, teacher, msg="", staff_msg=""):
     mine = [s for s in all_jobs() if s.get("owner") == viewer or (teacher and not s.get("owner"))]
     rows = "".join(
         f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{'teacher' if not is_student(s) else 'student'}</td>"
@@ -598,14 +911,6 @@ def home(viewer, teacher, msg=""):
         f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created']))}</td></tr>" for s in mine)
     mode_pick = ("<select name=mode><option value=teacher>Teacher: draft sourced additions</option>"
                  "<option value=student>Student: check and coach</option></select>") if teacher else ""
-    if teacher:
-        who = (f"<p class=mut>In the staff room as <b>{e(teacher)}</b> · <form method=post action=/teacher/logout "
-               f"style=display:inline><button class=link>log out</button></form></p>")
-    else:
-        who = ("<details class=teacher><summary class=mut>Staff room (teacher login)</summary>"
-               "<form method=post action=/teacher class=card><input name=email type=email autocomplete=username "
-               "placeholder='Email' required><input name=password type=password autocomplete=current-password "
-               "placeholder='Password' required><button>Log in</button></form></details>")
     return page("Homework Wizard", f"""<h1>{HAT}<span class=hl>Homework Wizard</span></h1>
 <div class=motto>It checks your homework. It doesn't do it for you.</div>
 <p class=mut>Hand in your own draft. Every claim gets checked against real sources, and your work comes back marked:
@@ -618,7 +923,7 @@ what checks out, what to fix, and notes on how to make it stronger, with the sou
 <p><textarea name=text placeholder="Paste your draft here. Put each heading on its own line." required></textarea></p>
 <p><button>✏️ Hand it in</button></p></form>
 <h2>Your homework pile</h2><table>{rows or '<tr><td class=mut>Nothing handed in yet (only work handed in from this browser shows here).</td></tr>'}</table>
-{who}""")
+""", side=drawers(teacher, viewer, bool(staff_msg), staff_msg))
 
 TEACHER_SCRIPT = """<script>
 const W=t=>(t.match(/\\b\\w[\\w'’-]*\\b/g)||[]).length;
@@ -640,8 +945,10 @@ if(src.length)parts.push('Sources:\\n'+src.map((s,i)=>'['+(i+1)+'] '+s).join('\\
 document.getElementById('out').value=parts.join('\\n\\n');}
 </script>"""
 
-def report(st):
+def report(st, viewer=None, teacher=None):
     running = st["status"] in ("queued", "running")
+    hinting = any(h.get("status") == "pending" for h in st.get("hints", []))
+    can_hint = is_student(st) and st["status"] == "done" and st.get("owner") == viewer
     student = is_student(st)
     orig_words = words(st["text"])
     place = queue_place(st)
@@ -655,6 +962,15 @@ def report(st):
             f"<span>Original: {orig_words} words · {read_min(orig_words)} min</span>"
             + ("" if student else f"<span>With selected: <span id=nw>{orig_words}</span> words · <span id=nm>{read_min(orig_words)}</span> min</span>")
             + "</div>")
+    award = st.get("hint_award")
+    if award and st.get("owner") == viewer:
+        head += (f"<div class='card add'><b class=hand>{'Nice work!' if award['earned'] else 'Marked.'}</b> You scored {award['score']}%"
+                 + (" and earned a hint! Open the Cheat Sheet to see your hints." if award["earned"]
+                    else f". Score {award.get('needed', settings()['hint_score'])}% or more to earn a hint." if "needed" in award
+                    else ", but your hint wallet was already full.") + "</div>")
+    if can_hint:
+        head += (f"<p class=mut>Stuck on something? Highlight part of your writing below and tap <b>Get a hint</b> "
+                 f"(you have {hints_left(viewer)} of {MAX_HINTS}).</p>")
     if st["status"] == "error":
         head += f"<div class=card><b>Something went wrong:</b> {e(st.get('error'))} <form method=post action='/retry/{st['id']}'><button>Try again</button></form></div>"
     body = ""
@@ -670,6 +986,11 @@ def report(st):
         body += "<div class=orig>"
         for pi, p in enumerate(s["paras"], 1):
             body += f"<p data-k='o{si}_{pi}'>{e(p)}</p>"
+            for h in st.get("hints", []):
+                if h["k"] == f"o{si}_{pi}":
+                    body += (f"<div class='card add hint'><b class=hand>Hint</b> <span class=mut>for <q>{e(h['text'][:120])}</q></span>"
+                             + (f"<p>{cite_links(h['answer'], h.get('evidence', []))}</p>" if h.get("answer")
+                                else "<p class=mut>Thinking about it… this can take a minute or two.</p>") + "</div>")
             for ai, a in adds.get(pi, []):
                 if student:
                     body += (f"<div class='card add'><b class=hand>Teacher's note</b> <span class=mut>— {e(a.get('why'))}</span>"
@@ -709,7 +1030,12 @@ def report(st):
         tail = """<h2>Clean copy</h2><p class=mut>Tick the suggestions you want above, then write it out. New sections go before your closing paragraph.
 Citation numbers become a source list at the end.</p><p><button onclick=build()>✏️ Write out the clean copy</button></p><textarea id=out></textarea>"""
     logs = f"<details class=card {'open' if running else ''}><summary>Teacher's scratch pad (progress log)</summary><pre>{e(chr(10).join(st.get('log', [])[-60:]))}</pre></details>"
-    return page(st["title"], head + body + tail + logs + ("" if student else TEACHER_SCRIPT), refresh=running)
+    bar = ("<div id=hintbar role=dialog aria-label='Get a hint'><span>Hint on <b id=hb-text></b></span>"
+           f"<button type=button id=hb-go>Get a hint ({hints_left(viewer)} left)</button></div>"
+           f"<form id=hb-form method=post action='/hint/{st['id']}' hidden><input name=k id=hb-k><input name=text id=hb-t></form>"
+           if can_hint and hints_left(viewer) > 0 else "")
+    return page(st["title"], head + body + tail + logs + bar + ("" if student else TEACHER_SCRIPT), refresh=running or hinting,
+                side=drawers(teacher, viewer))
 
 
 class H(BaseHTTPRequestHandler):
@@ -755,7 +1081,7 @@ class H(BaseHTTPRequestHandler):
         m = re.match(r"^/job/([0-9a-f]+)(\.json)?$", p)
         st = self.job(m.group(1), teacher) if m else None
         if st:
-            return self.send(200, json.dumps(st, indent=1), "application/json") if m.group(2) else self.send(200, report(st))
+            return self.send(200, json.dumps(st, indent=1), "application/json") if m.group(2) else self.send(200, report(st, vid, teacher))
         self.send(404, page("Not found", "<p>Not found. <a href='/'>Home</a></p>"))
 
     def do_POST(self):
@@ -767,17 +1093,42 @@ class H(BaseHTTPRequestHandler):
             ip = (self.headers.get(IP_HEADER, "") if IP_HEADER else "").strip() or self.client_address[0]
             if lock_left(ip):
                 print(f"login refused (locked out) for {f('email')[:100]!r} from {ip}", flush=True)
-                return self.send(429, home(vid, None, f"Too many wrong passwords. Try again in {lock_left(ip) // 60 + 1} minutes."))
+                return self.send(429, home(vid, None, staff_msg=f"Too many wrong passwords. Try again in {lock_left(ip) // 60 + 1} minutes."))
             name = check_login(f("email"), f("password"))
             print(f"login {'ok' if name else 'FAILED'} for {f('email')[:100]!r} from {ip}", flush=True)
             if not name:
                 login_failed(ip); time.sleep(1.5)
                 left = LOCK_ATTEMPTS - len(failed.get(ip, []))
-                return self.send(403, home(vid, None, "Wrong email or password." + (
+                return self.send(403, home(vid, None, staff_msg="Wrong email or password." + (
                     f" {left} attempt{'s' if left > 1 else ''} left before a 1-hour lockout." if not lock_left(ip)
                     else " Locked out for 1 hour.")))
             failed.pop(ip, None)
             return self.send(303, "", loc="/", cookies=[f"hw_teacher={make_session(name)}; Path=/; Max-Age={SESSION_DAYS * 86400}; HttpOnly; SameSite=Lax"])
+        if self.path == "/teacher/settings" and teacher:
+            cfg = settings()
+            try:
+                cfg["hint_score"] = max(0, min(100, int(f("hint_score", cfg["hint_score"]))))
+                cfg["start_hints"] = max(0, min(MAX_HINTS, int(f("start_hints", cfg["start_hints"]))))
+            except ValueError:
+                pass
+            write_json(SETTINGS_FILE, cfg)
+            return self.send(303, "", loc="/")
+        m = re.match(r"^/hint/([0-9a-f]+)$", self.path)
+        if m:
+            st = self.job(m.group(1), teacher)
+            k, text = f("k"), " ".join(f("text").split())[:400]
+            ok = (st and is_student(st) and st["status"] == "done" and st.get("owner") == vid and re.fullmatch(r"o\d+_\d+", k)
+                  and len(text) >= 3 and text in " ".join(st["text"].split()))
+            if not ok:
+                return self.send(400, page("Hint", "<p>That can't get a hint. Highlight part of your own writing on a marked paper. <a href='/'>Back</a></p>"))
+            if change_hints(vid, -1) is None:
+                return self.send(303, "", loc=f"/job/{st['id']}")
+            with file_lock:
+                st = load(st["id"])
+                st.setdefault("hints", []).append({"k": k, "text": text, "status": "pending", "asked": time.time()})
+                save(st)
+            threading.Thread(target=make_hint, args=(st["id"], len(st["hints"]) - 1), daemon=True).start()
+            return self.send(303, "", loc=f"/job/{st['id']}")
         if self.path == "/teacher/logout":
             return self.send(303, "", loc="/", cookies=["hw_teacher=; Path=/; Max-Age=0"])
         if self.path == "/new":

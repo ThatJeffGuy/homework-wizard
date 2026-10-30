@@ -17,15 +17,22 @@ students, no paid API, no student data sent to an AI company.
   "compare it with...". Each tip points to a source.
 - **Topics you could add:** ideas the draft mentions but never explores, with questions to answer and sources to read.
 - **Live progress and queue position.** Jobs run one at a time; students can close the page and come back.
+- **Hints (up to 3):** on a marked paper, a student highlights part of their own writing and taps **Get a hint**. They
+  get a nudge (a guiding question, what to double-check, which source to read), never the answer. A paper scoring at
+  least the teacher's threshold (80% by default) earns another hint. New students start with 1 hint (adjustable).
+- **Cheat Sheet drawer (the legal kind):** their hints, plus tools that run in the browser and send nothing anywhere:
+  draft check (words, reading time, reading level, long sentences, overused words), an APA 7 / MLA 9 citation maker,
+  a "before you hand it in" checklist, a unit converter and a 25/5 study timer.
 - **Privacy between students:** each browser only lists its own jobs, and every job has an unguessable link.
   A student can have one job waiting at a time.
 
 ## Teacher mode
-Anyone who isn't logged in uses student mode. Teachers log in with their email and password (the **Teacher login**
-box at the bottom of the page) and get teacher mode as well: it also drafts sourced additions and new sections in the
+Anyone who isn't logged in uses student mode. Teachers log in with their email and password (the **Staff room**
+drawer on the right) and get teacher mode as well: it also drafts sourced additions and new sections in the
 writer's voice as tick-box suggestions, and **Build final text** assembles the draft, the ticked parts and a source
 list. Handy for model answers, worksheets and the teacher's own writing. Teacher-mode jobs are only visible to
-logged-in teachers; students never see the option.
+logged-in teachers; students never see the option. The Staff room also lists the teacher's work and holds the hint
+settings (score needed to earn a hint, hints a new student starts with).
 
 The school adds teachers on the server:
 ```
