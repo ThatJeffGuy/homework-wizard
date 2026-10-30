@@ -43,24 +43,32 @@ Run it with the same `DATA_DIR` (or `TEACHERS_FILE`) as the server. Passwords ar
 locked out for 1 hour. Behind a reverse proxy, set `CLIENT_IP_HEADER` (see below) or every visitor shares the proxy's
 address and one student's wrong guesses would lock everyone out.
 
-## How homework flows
-1. **Students practise freely.** Every draft they hand in to the site is marked just for them; teachers see none of it.
-2. **They hand it in when they're ready.** On a marked paper: type the **class word** from the teacher, pick the
-   assignment, type their name or student number, and confirm. The paper gets a **Handed in** stamp (and **Late** after
-   the due date), is locked, and can't be handed in again; the same student can't hand in twice for one assignment.
-3. **Teachers see handed-in work** per class and per assignment: who handed in and when, late ones, scores, hints
-   used, AI-scan results, and who hasn't handed in yet. **Hand back** reopens a paper so the student can hand in again.
-4. **Hints** are earned when a paper is handed in with a good score, not for practice drafts.
+## Classes (a familiar, Google Classroom-style workspace)
+Students don't need accounts: they **join a class** on the home page with the teacher's **class word** (5 to 7
+letters, like `OTTER`) and their name, and that browser remembers it.
 
-## Classrooms, profiles and the AI-writing scan (teachers)
-- **Classrooms:** make a class in the Staff room and it gets a **class word** (5 to 7 letters, like `OTTER`). Add
-  assignments with optional due dates on the class page. Teachers can also hand in a student's paper themselves
-  (pick the class and assignment, type the student's name).
-- **Class page:** class average, assignments (handed in, late, average), and per student: papers, average, latest
-  score with trend, reading level and AI-scan flags. **Student page:** every handed-in paper with score, words,
-  reading level and AI-scan result.
+- **Home:** class cards. Teachers see students and papers waiting to be graded, and can create a class. Students see
+  their classes and a **To-do** list across all of them: Assigned, Missing (past due) and Done.
+- **Stream:** teacher announcements; new assignments are posted there automatically.
+- **Classwork:** assignments grouped by topic, with instructions, points, a due date and links. Students see their
+  status on each (Assigned, Turned in, Graded 8/10, Missing); teachers see turned in / assigned / graded counts.
+- **People:** the teacher and the students who joined; teachers can remove a student.
+- **Grades** (teachers): a gradebook of students by assignments, with missing work, papers still to grade, and
+  averages per student and per assignment.
+
+**The flow:** students practise privately as often as they like (teachers see none of it). When a marked draft is
+ready, they **turn it in** from the assignment (or from the paper itself), confirm, and it's locked with a
+**Turned in** stamp (**Late** after the due date); the same student can't turn in twice for one assignment. The
+teacher opens it, sees a **suggested grade** from the marking score, sets the grade, adds a **private comment** and
+**returns** it; the student sees the grade and comment. **Return for a redo** unlocks it so they can turn in again.
+Hints are earned when work is turned in with a good score, not for practice drafts.
+
+## Teacher tools
+- **Student profiles:** every turned-in paper with grade, marking score, words, reading level and AI-scan result,
+  plus missing work.
 - **What to do with a paper (teacher form):** mark it, mark it and scan for AI writing, or AI scan only (fast, no web
-  research). Any paper a teacher opens also has a **Scan for AI writing** button.
+  research), optionally turned straight in for a student. Any paper a teacher opens also has a
+  **Scan for AI writing** button.
 - **AI-writing scan:** signals, not a verdict. It looks at sentence rhythm, stock AI phrases, personal voice,
   paragraph sizes, the local model's read (with quoted passages), and, the most useful one, how much the paper differs
   from the same student's earlier papers in that class. Result: few / some / strong signs, each reason shown.
@@ -79,7 +87,7 @@ minute a page on a CPU, and the report notes that it was read from a photo. PDFs
 (poppler-utils); Pillow (`python3-pil`) is optional and makes big phone photos much faster to read.
 
 ## Requirements
-- Python 3.10+ (standard library only, nothing to `pip install`)
+- Python 3.12+ (standard library only, nothing to `pip install`)
 - [Ollama](https://ollama.com) with a model that follows instructions well. Tested with `glm-4.7-flash:q4_K_M`
   (30B mixture-of-experts, ~19 GB) on **CPU only**: about 12 tokens/s on an older dual-Xeon server, roughly
   20-60 minutes per piece. For a whole class, use a GPU with 24 GB+ or a smaller model (e.g. `qwen3:8b`, faster but

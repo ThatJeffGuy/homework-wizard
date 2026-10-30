@@ -823,7 +823,6 @@ def ai_card(st):
             + "</details>")
 
 
-# ---------- classrooms + student profiles (teachers hand in work with a class and a student name/number) ----------
 # class words: easy for students to type; 5 to 7 letters
 CLASS_WORDS = """acorn apple badger bagel banjo beacon beaver bison blossom bonsai breeze bridge bubble buffalo button cactus
 camel canoe canyon carrot castle cedar cherry chimney clover cobalt comet compass condor coral cotton coyote
@@ -839,38 +838,42 @@ sketch sloth snail sparrow sphinx spider spruce squash squid summit sunset sushi
 timber tomato topaz tornado toucan tractor trumpet tulip tundra turkey turnip turtle tuxedo uncle unicorn valley
 velvet violet viper volcano waffle walnut walrus whale wizard wombat yogurt zebra zephyr zipper""".split()
 
+# ---------- classrooms: stream, classwork, people, grades (students join with the class word + their name) ----------
+CLASS_COLORS = ["#1e6f5c", "#2f5d9e", "#a1452b", "#6b4c9a", "#9a6b00", "#246b8f", "#8a3b5e", "#4f6b2a"]
+
 def all_classes():
     return read_json(CLASSES_FILE, {})
+
+def save_classes(classes):
+    write_json(CLASSES_FILE, classes)
 
 def classes_for(teacher):
     return {c: v for c, v in all_classes().items() if v.get("teacher") == teacher}
 
-def create_class(teacher, name):
+def create_class(teacher, name, section=""):
     with file_lock:
         classes = all_classes()
         free = [w.upper() for w in CLASS_WORDS if w.upper() not in classes]
         code = secrets.choice(free) if free else None
         while not code or code in classes:   # every word taken: add two digits
             code = secrets.choice(CLASS_WORDS).upper() + str(secrets.randbelow(90) + 10)
-        classes[code] = {"name": name.strip()[:80] or code, "teacher": teacher, "created": time.strftime("%Y-%m-%d")}
-        write_json(CLASSES_FILE, classes)
+        classes[code] = {"name": " ".join(name.split())[:80] or code, "section": " ".join(section.split())[:80],
+                         "teacher": teacher, "created": time.strftime("%Y-%m-%d"),
+                         "color": CLASS_COLORS[len(classes) % len(CLASS_COLORS)],
+                         "assignments": [], "posts": [], "roster": {}}
+        save_classes(classes)
     return code
+
+def update_class(code, fn):
+    """Change one class under the lock: fn(class_dict) edits it in place."""
+    with file_lock:
+        classes = all_classes()
+        if code in classes:
+            fn(classes[code])
+            save_classes(classes)
 
 def student_key(name):
     return " ".join(name.lower().split())[:80]
-
-def add_assignment(teacher, code, title, due):
-    with file_lock:
-        classes = all_classes()
-        c = classes.get(code)
-        if not c or c.get("teacher") != teacher:
-            return None
-        aid = secrets.token_hex(4)
-        c.setdefault("assignments", []).append({"id": aid, "title": " ".join(title.split())[:120] or "Assignment",
-                                                "due": due if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due or "") else "",
-                                                "created": time.strftime("%Y-%m-%d")})
-        write_json(CLASSES_FILE, classes)
-    return aid
 
 def assignment(code, aid):
     return next((a for a in all_classes().get(code, {}).get("assignments", []) if a["id"] == aid), None)
@@ -887,6 +890,55 @@ def class_info(word):
             "assignments": [{"id": a["id"], "title": a["title"], "due": a.get("due", ""), "late": is_late(a, time.time())}
                             for a in reversed(c.get("assignments", []))]}
 
+# --- joining: a browser remembers which classes it joined, under which name ---
+def joined(viewer):
+    """{code: name} for the classes this browser joined and is still on the roster of."""
+    mine = read_json(STUDENTS_FILE, {}).get(viewer or "", {}).get("classes", {})
+    classes = all_classes()
+    return {c: n for c, n in mine.items() if c in classes and student_key(n) in classes[c].get("roster", {})}
+
+def join_class(viewer, word, name):
+    code = re.sub(r"[^A-Z0-9-]", "", word.upper())[:12]
+    name = " ".join(name.split())[:80]
+    if code not in all_classes():
+        return None, f"No class uses the word {code or '(empty)'}. Check the spelling with your teacher."
+    if not name:
+        return None, "Type your name or student number so your teacher knows who you are."
+    update_class(code, lambda c: c.setdefault("roster", {}).setdefault(student_key(name), {"name": name, "joined": time.strftime("%Y-%m-%d")}))
+    with file_lock:
+        students = read_json(STUDENTS_FILE, {})
+        students.setdefault(viewer, {}).setdefault("classes", {})[code] = name
+        write_json(STUDENTS_FILE, students)
+    return code, ""
+
+def leave_class(viewer, code):
+    with file_lock:
+        students = read_json(STUDENTS_FILE, {})
+        students.get(viewer, {}).get("classes", {}).pop(code, None)
+        write_json(STUDENTS_FILE, students)
+
+# --- work: a handed-in paper is a job with "handin"; the teacher grades and returns it ---
+def class_jobs(code):
+    return [j for j in all_jobs() if j.get("classroom") == code and j.get("handin")]
+
+def work_for(jobs, aid, key):
+    return next((j for j in jobs if j["handin"].get("assignment") == aid and j.get("student_key") == key), None)
+
+def work_status(a, j):
+    """(label, css class) for one student's work on one assignment."""
+    if j:
+        h = j["handin"]
+        if h.get("returned"):
+            return (f"Graded {h['grade']}/{a.get('points', 100)}" if h.get("grade") is not None else "Returned"), "supported"
+        return ("Turned in late" if h.get("late") else "Turned in"), "partly"
+    if a.get("due") and time.strftime("%Y-%m-%d") > a["due"]:
+        return "Missing", "contradicted"
+    return "Assigned", "pending"
+
+def suggested_grade(j, points):
+    sc = score(j)
+    return round(sc * points / 100) if sc is not None else ""
+
 def hand_in(jid, code, aid, student, by_teacher=None):
     """Lock a paper into a class (and assignment). Returns an error message, or "" when it worked."""
     student = " ".join(student.split())[:80]
@@ -901,128 +953,295 @@ def hand_in(jid, code, aid, student, by_teacher=None):
     with file_lock:
         st = load(jid)
         if st.get("handin"):
-            return "This paper has already been handed in."
-        if aid and any(j.get("classroom") == code and j.get("student_key") == key and (j.get("handin") or {}).get("assignment") == aid
-                       for j in all_jobs()):
-            return (f"{student} has already handed in “{a['title']}”. If you need to hand in a new version, ask your teacher "
-                    "to hand the first one back.")
+            return "This paper has already been turned in."
+        if aid and work_for(class_jobs(code), aid, key):
+            return (f"{student} has already turned in “{a['title']}”. If you need to turn in a new version, ask your teacher "
+                    "to return the first one for a redo.")
         now = time.time()
         st["handin"] = {"classroom": code, "assignment": aid, "student": student, "at": now, "late": is_late(a, now),
                         "hints_used": len(st.get("hints", [])), "by_teacher": by_teacher}
         st.update(classroom=code, student=student, student_key=key)
         award_hint(st)
         save(st)
+    update_class(code, lambda c: c.setdefault("roster", {}).setdefault(key, {"name": student, "joined": time.strftime("%Y-%m-%d")}))
     return ""
 
+def grade_work(jid, grade, comment):
+    with file_lock:
+        st = load(jid)
+        h = st["handin"]
+        h.update(grade=grade, comment=comment.strip()[:4000], returned=time.time())
+        save(st)
+
 def hand_back(jid):
+    """Return for redo: unlock the paper so the student can turn in again."""
     with file_lock:
         st = load(jid)
         for k in ("handin", "classroom", "student", "student_key"):
             st.pop(k, None)
         save(st)
 
-def paper_row(j):
-    sc = score(j)
-    s = text_stats(j["text"]) if j.get("text") else {}
-    ai = (j.get("ai") or {}).get("level")
-    ai_cell = "<span class='v %s'>%s</span>" % (AI_LEVEL[ai][0], ai) if ai else "–"
-    return ("<tr><td class=mut>%s</td><td><a href='/job/%s'>%s</a></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-            % (time.strftime("%Y-%m-%d", time.localtime(j["created"])), j["id"], e(j["title"]), STATUS.get(j["status"], e(j["status"])),
-               "%s%%" % sc if sc is not None else "–", s.get("words", "–"), s.get("grade", "–"), ai_cell))
-
 def avg(xs):
     xs = [x for x in xs if x is not None]
     return round(sum(xs) / len(xs)) if xs else None
 
-def class_page(code, teacher, viewer):
-    c = classes_for(teacher).get(code)
-    if not c:
-        return None
-    jobs = [j for j in all_jobs() if j.get("classroom") == code]
-    marked = [j for j in jobs if j["status"] == "done"]
-    people = {}
-    for j in sorted(jobs, key=lambda j: j["created"]):
-        people.setdefault(j["student_key"], {"name": j.get("student", j["student_key"]), "jobs": []})["jobs"].append(j)
+def pct(j, a):
+    h = j["handin"] if j else {}
+    if h.get("grade") is not None and a.get("points"):
+        return round(100 * h["grade"] / a["points"])
+    return None
+
+# --- pages ---
+def class_banner(code, c, tab, teacher):
+    tabs = [("stream", "Stream"), ("classwork", "Classwork"), ("people", "People")] + ([("grades", "Grades")] if teacher else [])
+    return (f"<p><a href='/'>← Home</a></p><div class=banner style='--cc:{c.get('color', CLASS_COLORS[0])}'>"
+            f"<h1>{e(c['name'])}</h1><p>{e(c.get('section', ''))}</p>"
+            + (f"<p class=word>Class word <b>{code}</b></p>" if teacher else "") + "</div>"
+            "<nav class=tabs>" + "".join(f"<a href='/class/{code}?tab={t}' class='{'on' if t == tab else ''}'>{label}</a>" for t, label in tabs)
+            + "</nav>")
+
+def stream_tab(code, c, teacher):
+    posts = sorted(c.get("posts", []), key=lambda p: -p["at"])
+    out = ""
+    if teacher:
+        out += (f"<form method=post action='/class/{code}/post' class=card><textarea name=text required placeholder='Announce something to your class' "
+                "style=min-height:90px></textarea><p><button>Post</button></p></form>")
+    for p in posts:
+        a = assignment(code, p.get("aid", "")) if p.get("aid") else None
+        when = time.strftime("%b %d", time.localtime(p["at"]))
+        if a:
+            out += (f"<a class='card post assign' href='/class/{code}/a/{a['id']}'><b>New assignment: {e(a['title'])}</b>"
+                    f"<span class=mut> · {when}{' · due ' + e(a['due']) if a.get('due') else ''}</span></a>")
+        elif not p.get("aid"):
+            out += (f"<div class='card post'><p class=mut>{when}</p><p style='white-space:pre-wrap'>{e(p['text'])}</p>"
+                    + (f"<form method=post action='/class/{code}/post/{p['id']}/delete'><button class=link>Delete</button></form>" if teacher else "")
+                    + "</div>")
+    return out or "<p class=mut>Nothing here yet. Announcements and new assignments show up here.</p>"
+
+def classwork_tab(code, c, teacher, me=None):
+    jobs = class_jobs(code)
+    roster = c.get("roster", {})
+    topics = {}
+    for a in reversed(c.get("assignments", [])):
+        topics.setdefault(a.get("topic") or "", []).append(a)
+    out = ""
+    if teacher:
+        out += (f"<details class=card><summary><b>+ Create assignment</b></summary><form method=post action='/class/{code}/assign'>"
+                "<label class=mut>Title<input name=title required></label>"
+                "<label class=mut>Instructions (optional)<textarea name=instructions style=min-height:110px></textarea></label>"
+                "<div class=row><label class=mut>Points<input name=points type=number min=1 max=1000 value=100></label>"
+                "<label class=mut>Due (optional)<input name=due type=date></label>"
+                f"<label class=mut>Topic (optional)<input name=topic list=topics></label></div>"
+                "<datalist id=topics>" + "".join(f"<option value='{e(t)}'>" for t in topics if t) + "</datalist>"
+                "<label class=mut>Links for students, one per line (optional)<textarea name=links style=min-height:60px></textarea></label>"
+                "<p><button>Assign</button></p></form></details>")
+    for topic, items in sorted(topics.items(), key=lambda x: (x[0] == "", x[0].lower())):
+        out += f"<h2>{e(topic) if topic else 'Assignments'}</h2>"
+        for a in items:
+            if teacher:
+                got = [j for j in jobs if j["handin"].get("assignment") == a["id"]]
+                graded = sum(1 for j in got if j["handin"].get("returned"))
+                side = (f"<span class=mut>{len(got)} turned in · {max(0, len(roster) - len(got))} assigned · {graded} graded</span>")
+            else:
+                label, cls = work_status(a, work_for(jobs, a["id"], student_key(me)))
+                side = f"<span class='v {cls}'>{label}</span>"
+            out += (f"<a class='card work' href='/class/{code}/a/{a['id']}'><b>{e(a['title'])}</b>"
+                    f"<span class=mut>{' Due ' + e(a['due']) if a.get('due') else ' No due date'} · {a.get('points', 100)} points</span>{side}</a>")
+    return out if (topics or teacher) else "<p class=mut>No assignments yet.</p>"
+
+def people_tab(code, c, teacher):
+    roster = sorted(c.get("roster", {}).items(), key=lambda x: x[1]["name"].lower())
+    rows = "".join(f"<li>{('<a href=/class/%s/s/%s>%s</a>' % (code, urllib.parse.quote(k), e(v['name']))) if teacher else e(v['name'])}"
+                   + (f" <form method=post action='/class/{code}/remove/{urllib.parse.quote(k)}' style=display:inline "
+                      "onsubmit=\"return confirm('Remove this student from the class? Their turned-in work stays.')\">"
+                      "<button class=link>remove</button></form>" if teacher else "") + "</li>" for k, v in roster)
+    return (f"<h2>Teacher</h2><p>{e(c['teacher'])}</p><h2>Students <span class=mut>({len(roster)})</span></h2>"
+            + (f"<p class=mut>Students join on the home page with the class word <b>{code}</b> and their name.</p>" if teacher else "")
+            + (f"<ul class=people>{rows}</ul>" if rows else "<p class=mut>Nobody has joined yet.</p>"))
+
+def grades_tab(code, c):
+    jobs, roster = class_jobs(code), sorted(c.get("roster", {}).items(), key=lambda x: x[1]["name"].lower())
+    asg = list(c.get("assignments", []))
+    head = "".join(f"<th><a href='/class/{code}/a/{a['id']}'>{e(a['title'])}</a><br><span class=mut>{a.get('points', 100)} pts</span></th>" for a in asg)
     rows = ""
-    for key, p in sorted(people.items()):
-        done = [j for j in p["jobs"] if j["status"] == "done"]
-        scores = [score(j) for j in done if score(j) is not None]
-        trend = "" if len(scores) < 2 else ("▲" if scores[-1] > scores[-2] else "▼" if scores[-1] < scores[-2] else "=")
-        flags = sum(1 for j in done if (j.get("ai") or {}).get("level") in ("some", "strong"))
-        last_grade = text_stats(done[-1]["text"])["grade"] if done else "–"
-        rows += (f"<tr><td><a href='/class/{code}/s/{urllib.parse.quote(key)}'>{e(p['name'])}</a></td><td>{len(p['jobs'])}</td>"
-                 f"<td>{f'{avg(scores)}%' if scores else '–'}</td><td>{f'{scores[-1]}% {trend}' if scores else '–'}</td>"
-                 f"<td>{last_grade}</td><td>{flags or ''}</td></tr>")
-    ca = avg([score(j) for j in marked])
-    body = (f"<p><a href='/'>← Back to the pile</a></p><h1>{e(c['name'])}</h1>"
-            f"<p>Class word <b class=hand style='font-size:1.6rem;letter-spacing:.08em'>{code}</b> "
-            "<span class=mut>· students type this word when they hand in, and their work lands here.</span></p>"
-            f"<div class=stats><span>{len(people)} students</span><span>{len(jobs)} papers</span>"
-            f"<span>Class average: {f'{ca}%' if ca is not None else '–'}</span>"
-            f"<span>Avg reading level: {avg([text_stats(j['text'])['grade'] for j in marked if j.get('text')]) or '–'}</span></div>"
-            + assignments_block(code, c, jobs) +
-            "<h2>Students</h2><div style=overflow-x:auto><table><tr class=mut><td>Student</td><td>Papers</td><td>Average</td>"
-            f"<td>Latest</td><td>Reading level</td><td>AI flags</td></tr>{rows or '<tr><td class=mut colspan=6>Nothing handed in yet.</td></tr>'}</table></div>"
-            "<p class=mut>Scores are the share of checked claims that held up. AI flags count papers with some or strong signs; "
-            "open the paper to see why, and remember they are not proof.</p>")
+    for k, v in roster:
+        cells, pcts = "", []
+        for a in asg:
+            j = work_for(jobs, a["id"], k)
+            label, cls = work_status(a, j)
+            if j and j["handin"].get("grade") is not None:
+                cells += f"<td><a href='/job/{j['id']}'>{j['handin']['grade']}</a></td>"; pcts.append(pct(j, a))
+            elif j:
+                cells += f"<td><a href='/job/{j['id']}' class='v partly'>{'late' if j['handin'].get('late') else 'to mark'}</a></td>"
+            else:
+                cells += f"<td><span class='v {cls}'>{label.lower()}</span></td>" if label == "Missing" else "<td class=mut>–</td>"
+        av = avg(pcts)
+        rows += f"<tr><td><a href='/class/{code}/s/{urllib.parse.quote(k)}'>{e(v['name'])}</a></td><td><b>{f'{av}%' if av is not None else '–'}</b></td>{cells}</tr>"
+    avgs = "".join(f"<td><b>{(lambda x: f'{x}%' if x is not None else '–')(avg([pct(j, a) for j in jobs if j['handin'].get('assignment') == a['id']]))}</b></td>" for a in asg)
+    return (f"<div style=overflow-x:auto><table class=grades><tr><th>Student</th><th>Average</th>{head}</tr>"
+            f"<tr class=mut><td>Class average</td><td></td>{avgs}</tr>{rows or '<tr><td class=mut colspan=2>Nobody has joined yet.</td></tr>'}</table></div>"
+            "<p class=mut>Grades are the points you give when you return work (the marking score is only a suggestion).</p>")
+
+def class_view(code, tab, teacher, viewer):
+    c = all_classes().get(code)
+    owner = c and teacher and c.get("teacher") == teacher
+    me = joined(viewer).get(code)
+    if not c or not (owner or me):
+        return None
+    tab = tab if tab in ("stream", "classwork", "people", "grades") else "stream"
+    if tab == "grades" and not owner:
+        tab = "stream"
+    body = class_banner(code, c, tab, owner)
+    body += {"stream": lambda: stream_tab(code, c, owner), "classwork": lambda: classwork_tab(code, c, owner, me),
+             "people": lambda: people_tab(code, c, owner), "grades": lambda: grades_tab(code, c)}[tab]()
+    if me and not owner:
+        body += (f"<form method=post action='/class/{code}/leave' onsubmit=\"return confirm('Leave this class on this device?')\">"
+                 f"<p class=mut>You're in this class as <b>{e(me)}</b>. <button class=link>Leave class</button></p></form>")
     return page(c["name"], body, side=drawers(teacher, viewer))
 
-def assignments_block(code, c, jobs):
-    rows = ""
-    for a in reversed(c.get("assignments", [])):
-        got = [j for j in jobs if (j.get("handin") or {}).get("assignment") == a["id"]]
-        late = sum(1 for j in got if j["handin"].get("late"))
-        av = avg([score(j) for j in got])
-        rows += (f"<tr><td><a href='/class/{code}/a/{a['id']}'>{e(a['title'])}</a></td><td>{e(a.get('due') or '–')}</td>"
-                 f"<td>{len(got)}</td><td>{late or ''}</td><td>{f'{av}%' if av is not None else '–'}</td></tr>")
-    return ("<h2>Assignments</h2><div style=overflow-x:auto><table><tr class=mut><td>Assignment</td><td>Due</td><td>Handed in</td>"
-            f"<td>Late</td><td>Average</td></tr>{rows or '<tr><td class=mut colspan=5>No assignments yet.</td></tr>'}</table></div>"
-            f"<form method=post action='/class/{code}/assign' class='card row'><input name=title placeholder='New assignment, e.g. Volcano report' required>"
-            "<label class=num>Due <input name=due type=date style=width:auto></label><button>Add assignment</button></form>")
-
-def assignment_page(code, aid, teacher, viewer):
-    c, a = classes_for(teacher).get(code), assignment(code, aid)
-    if not c or not a:
+def assignment_view(code, aid, teacher, viewer):
+    c, a = all_classes().get(code), assignment(code, aid)
+    owner = c and teacher and c.get("teacher") == teacher
+    me = joined(viewer).get(code)
+    if not a or not (owner or me):
         return None
-    jobs = [j for j in all_jobs() if j.get("classroom") == code]
-    got = sorted([j for j in jobs if (j.get("handin") or {}).get("assignment") == aid], key=lambda j: j["handin"]["at"])
-    rows = ""
-    for j in got:
-        h, sc, ai = j["handin"], score(j), (j.get("ai") or {}).get("level")
-        rows += (f"<tr><td>{e(h['student'])}</td><td><a href='/job/{j['id']}'>{e(j['title'])}</a></td>"
-                 f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(h['at']))}</td>"
-                 f"<td>{'<span class="v contradicted">late</span>' if h.get('late') else ''}</td>"
-                 f"<td>{f'{sc}%' if sc is not None else '–'}</td><td>{h.get('hints_used', 0) or ''}</td>"
-                 + ("<td><span class='v %s'>%s</span></td>" % (AI_LEVEL[ai][0], ai) if ai else "<td>–</td>") + "</tr>")
-    handed = {j["student_key"] for j in got}
-    missing = sorted({j.get("student", j["student_key"]) for j in jobs if j["student_key"] not in handed})
-    av = avg([score(j) for j in got])
-    body = (f"<p><a href='/class/{code}'>← {e(c['name'])}</a></p><h1>{e(a['title'])}</h1>"
-            f"<div class=stats><span>Due: {e(a.get('due') or 'no due date')}</span><span>{len(got)} handed in</span>"
-            f"<span>{sum(1 for j in got if j['handin'].get('late'))} late</span><span>Average: {f'{av}%' if av is not None else '–'}</span></div>"
-            "<div style=overflow-x:auto><table><tr class=mut><td>Student</td><td>Paper</td><td>Handed in</td><td></td><td>Score</td>"
-            f"<td>Hints used</td><td>AI scan</td></tr>{rows or '<tr><td class=mut colspan=7>Nothing handed in yet.</td></tr>'}</table></div>"
-            + (f"<h2>Not handed in yet</h2><p>{', '.join(e(n) for n in missing)}</p><p class=mut>Students who have handed in other "
-               "work to this class but not this assignment.</p>" if missing else ""))
-    return page(a["title"], body, side=drawers(teacher, viewer))
+    info = (f"<div class='card'><h1 style=margin-top:0>{e(a['title'])}</h1><p class=mut>{e(c['name'])} · {a.get('points', 100)} points"
+            f"{' · due ' + e(a['due']) if a.get('due') else ' · no due date'}</p>"
+            + (f"<p style='white-space:pre-wrap'>{e(a['instructions'])}</p>" if a.get("instructions") else "")
+            + "".join(f"<p><a href='{e(u)}' target=_blank rel=noopener>{e(u)}</a></p>" for u in a.get("links", []))
+            + "</div>")
+    back = f"<p><a href='/class/{code}?tab=classwork'>← {e(c['name'])}: Classwork</a></p>"
+    jobs = class_jobs(code)
+    if owner:
+        roster = sorted(c.get("roster", {}).items(), key=lambda x: x[1]["name"].lower())
+        rows = ""
+        for k, v in roster:
+            j = work_for(jobs, aid, k)
+            label, cls = work_status(a, j)
+            h = j["handin"] if j else {}
+            rows += (f"<tr><td>{e(v['name'])}</td><td><span class='v {cls}'>{label}</span></td>"
+                     f"<td>{('<a href=/job/%s>%s</a>' % (j['id'], e(j['title']))) if j else '–'}</td>"
+                     f"<td class=mut>{time.strftime('%b %d %H:%M', time.localtime(h['at'])) if j else ''}</td>"
+                     f"<td>{(str(score(j)) + '%') if j and score(j) is not None else ''}</td><td>{h.get('hints_used') or ''}</td>"
+                     + ("<td><span class='v %s'>%s</span></td>" % (AI_LEVEL[j['ai']['level']][0], j['ai']['level']) if j and j.get('ai') else "<td></td>")
+                     + "</tr>")
+        got = [j for j in jobs if j["handin"].get("assignment") == aid]
+        body = (back + info + f"<div class=stats><span>{len(got)} turned in</span><span>{max(0, len(roster) - len(got))} assigned</span>"
+                f"<span>{sum(1 for j in got if j['handin'].get('returned'))} graded</span></div>"
+                "<h2>Student work</h2><div style=overflow-x:auto><table><tr class=mut><td>Student</td><td>Status</td><td>Paper</td>"
+                f"<td>Turned in</td><td>Marking</td><td>Hints</td><td>AI scan</td></tr>{rows or '<tr><td class=mut colspan=7>Nobody has joined yet.</td></tr>'}</table></div>"
+                f"<form method=post action='/class/{code}/a/{aid}/delete' onsubmit=\"return confirm('Delete this assignment? Turned-in papers stay with the students.')\">"
+                "<p><button class=link>Delete assignment</button></p></form>")
+        return page(a["title"], body, side=drawers(teacher, viewer))
+    mine = work_for(jobs, aid, student_key(me))
+    label, cls = work_status(a, mine)
+    card = f"<div class='card yourwork'><h2 style=margin-top:0>Your work <span class='v {cls}'>{label}</span></h2>"
+    if mine:
+        card += f"<p><a href='/job/{mine['id']}'>{e(mine['title'])}</a></p>"
+        h = mine["handin"]
+        if h.get("returned"):
+            card += (f"<p><b>Grade: {h['grade']}/{a.get('points', 100)}</b></p>" if h.get("grade") is not None else "")
+            card += f"<div class='card add'><b class=hand>Private comment from your teacher</b><p style='white-space:pre-wrap'>{e(h.get('comment') or '(no comment)')}</p></div>" if h.get("comment") else ""
+    else:
+        papers = [j for j in all_jobs() if j.get("owner") == viewer and is_student(j) and j["status"] == "done" and not j.get("handin")]
+        opts = "".join(f"<label class=sure><input type=radio name=job value={j['id']} required> {e(j['title'])} "
+                       f"<span class=mut>({time.strftime('%b %d', time.localtime(j['created']))}"
+                       f"{', ' + str(score(j)) + '% check out' if score(j) is not None else ''})</span></label>" for j in papers)
+        card += ("<p class=mut>Practise on the home page as often as you like. When a marked draft is ready, pick it here and turn it in.</p>"
+                 + (f"<form method=post action='/class/{code}/a/{aid}/turnin' id=turnin>{opts}"
+                    "<label class=sure><input type=checkbox name=sure value=1 required> I'm ready. I understand that once it's turned in I can't change it or turn it in again.</label>"
+                    "<p><button>Turn in</button></p></form>"
+                    "<script>document.getElementById('turnin').addEventListener('submit',ev=>{if(!confirm('Turn this in now? You won\\'t be able to change it or turn it in again.'))ev.preventDefault()})</script>"
+                    if papers else "<p><a href='/'>Write and practise a draft</a> first; once it's marked it shows up here.</p>"))
+    card += "</div>"
+    return page(a["title"], back + info + card, side=drawers(teacher, viewer))
 
-def student_page(code, key, teacher, viewer):
+def student_profile(code, key, teacher, viewer):
     c = classes_for(teacher).get(code)
-    jobs = [j for j in all_jobs() if j.get("classroom") == code and j.get("student_key") == key] if c else []
-    if not jobs:
+    if not c or key not in c.get("roster", {}):
         return None
-    jobs.sort(key=lambda j: j["created"])
-    done = [j for j in jobs if j["status"] == "done"]
-    mine, cls = avg([score(j) for j in done]), avg([score(j) for j in all_jobs() if j.get("classroom") == code and j["status"] == "done"])
-    body = (f"<p><a href='/class/{code}'>← {e(c['name'])}</a></p><h1>{e(jobs[-1].get('student', key))}</h1>"
-            f"<div class=stats><span>{len(jobs)} papers</span><span>Average: {f'{mine}%' if mine is not None else '–'}</span>"
-            f"<span>Class average: {f'{cls}%' if cls is not None else '–'}</span>"
-            f"<span>Avg reading level: {avg([text_stats(j['text'])['grade'] for j in done if j.get('text')]) or '–'}</span></div>"
-            "<div style=overflow-x:auto><table><tr class=mut><td>Date</td><td>Paper</td><td>Status</td><td>Score</td><td>Words</td>"
-            f"<td>Reading level</td><td>AI scan</td></tr>{''.join(paper_row(j) for j in reversed(jobs))}</table></div>"
-            "<p class=mut>The AI scan compares each paper with this student's earlier ones, so it gets more useful as their "
-            "papers build up here.</p>")
-    return page(jobs[-1].get("student", key), body, side=drawers(teacher, viewer))
+    jobs = sorted([j for j in class_jobs(code) if j.get("student_key") == key], key=lambda j: j["handin"]["at"])
+    asg = {a["id"]: a for a in c.get("assignments", [])}
+    rows = ""
+    for j in reversed(jobs):
+        a, h = asg.get(j["handin"].get("assignment")), j["handin"]
+        s = text_stats(j["text"]) if j.get("text") else {}
+        ai = (j.get("ai") or {}).get("level")
+        rows += (f"<tr><td class=mut>{time.strftime('%Y-%m-%d', time.localtime(h['at']))}</td><td><a href='/job/{j['id']}'>{e(j['title'])}</a></td>"
+                 f"<td>{e(a['title']) if a else 'other work'}</td>"
+                 f"<td>{(str(h['grade']) + '/' + str(a.get('points', 100))) if a and h.get('grade') is not None else ('late' if h.get('late') else '–')}</td>"
+                 f"<td>{(str(score(j)) + '%') if score(j) is not None else '–'}</td><td>{s.get('words', '–')}</td><td>{s.get('grade', '–')}</td>"
+                 + ("<td><span class='v %s'>%s</span></td>" % (AI_LEVEL[ai][0], ai) if ai else "<td>–</td>") + "</tr>")
+    missing = [a for a in c.get("assignments", []) if a.get("due") and time.strftime("%Y-%m-%d") > a["due"] and not work_for(jobs, a["id"], key)]
+    body = (f"<p><a href='/class/{code}?tab=people'>← {e(c['name'])}: People</a></p><h1>{e(c['roster'][key]['name'])}</h1>"
+            f"<div class=stats><span>{len(jobs)} turned in</span><span>{len(missing)} missing</span>"
+            f"<span>Average grade: {(lambda x: f'{x}%' if x is not None else '–')(avg([pct(j, asg[j['handin']['assignment']]) for j in jobs if j['handin'].get('assignment') in asg]))}</span>"
+            f"<span>Avg reading level: {avg([text_stats(j['text'])['grade'] for j in jobs if j.get('text')]) or '–'}</span></div>"
+            "<div style=overflow-x:auto><table><tr class=mut><td>Turned in</td><td>Paper</td><td>Assignment</td><td>Grade</td><td>Marking</td>"
+            f"<td>Words</td><td>Reading level</td><td>AI scan</td></tr>{rows or '<tr><td class=mut colspan=8>Nothing turned in yet.</td></tr>'}</table></div>"
+            + (f"<p><b>Missing:</b> {', '.join(e(a['title']) for a in missing)}</p>" if missing else "")
+            + "<p class=mut>The AI scan compares each paper with this student's earlier ones, so it gets more useful as their work builds up.</p>")
+    return page(c["roster"][key]["name"], body, side=drawers(teacher, viewer))
+
+def class_cards(teacher, viewer):
+    """Home page: class cards (and the student's to-do list)."""
+    classes = all_classes()
+    if teacher:
+        mine = classes_for(teacher)
+        cards = ""
+        for code, c in sorted(mine.items(), key=lambda x: x[1]["name"].lower()):
+            to_mark = sum(1 for j in class_jobs(code) if not j["handin"].get("returned"))
+            cards += (f"<a class=ccard href='/class/{code}' style='--cc:{c.get('color', CLASS_COLORS[0])}'><span class=ctop><b>{e(c['name'])}</b>"
+                      f"<span>{e(c.get('section', ''))}</span></span><span class=cbody>{len(c.get('roster', {}))} students"
+                      f"{f' · <b>{to_mark} to mark</b>' if to_mark else ''}<br><span class=mut>Class word {code}</span></span></a>")
+        cards += ("<form method=post action=/teacher/class class='ccard new'><b>Create a class</b><input name=name placeholder='Class name' required>"
+                  "<input name=section placeholder='Section (optional)'><button>Create</button></form>")
+        return f"<h2>Your classes</h2><div class=cards>{cards}</div>"
+    mine = joined(viewer)
+    cards, todo = "", []
+    for code, name in sorted(mine.items(), key=lambda x: classes[x[0]]["name"].lower()):
+        c, jobs = classes[code], class_jobs(code)
+        for a in c.get("assignments", []):
+            label, cls = work_status(a, work_for(jobs, a["id"], student_key(name)))
+            todo.append((label, cls, a, code, c))
+        due = [t for t in todo if t[3] == code and t[0] in ("Assigned", "Missing")]
+        cards += (f"<a class=ccard href='/class/{code}' style='--cc:{c.get('color', CLASS_COLORS[0])}'><span class=ctop><b>{e(c['name'])}</b>"
+                  f"<span>{e(c.get('section', ''))}</span></span><span class=cbody>{len(due)} to do<br><span class=mut>You: {e(name)}</span></span></a>")
+    cards += ("<form method=post action=/join class='ccard new'><b>Join a class</b><input name=classword placeholder='Class word' required "
+              "autocapitalize=characters autocomplete=off><input name=name placeholder='Your name or student number' required autocomplete=name>"
+              "<button>Join</button></form>")
+    order = {"Missing": 0, "Assigned": 1}
+    open_items = sorted([t for t in todo if t[0] in order], key=lambda t: (order[t[0]], t[2].get("due") or "9999"))
+    done = [t for t in todo if t[0] not in order]
+    li = lambda t: (f"<li><a href='/class/{t[3]}/a/{t[2]['id']}'>{e(t[2]['title'])}</a> <span class=mut>· {e(t[4]['name'])}"
+                    f"{' · due ' + e(t[2]['due']) if t[2].get('due') else ''}</span> <span class='v {t[1]}'>{t[0]}</span></li>")
+    todo_html = ""
+    if mine:
+        todo_html = ("<h2>To-do</h2>" + (f"<ul class=todo>{''.join(li(t) for t in open_items)}</ul>" if open_items else "<p class=mut>All caught up!</p>")
+                     + (f"<details><summary class=mut>Done ({len(done)})</summary><ul class=todo>{''.join(li(t) for t in done)}</ul></details>" if done else ""))
+    return f"<h2>Your classes</h2><div class=cards>{cards}</div>{todo_html}"
+
+CLASSROOM_CSS = """
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin:10px 0 6px}
+.ccard{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card);
+ color:var(--ink);text-decoration:none;box-shadow:1px 2px 0 rgba(0,0,0,.06);min-height:150px}
+.ccard .ctop{background:var(--cc);color:#fff;padding:12px 14px;display:flex;flex-direction:column;min-height:76px}
+.ccard .ctop b{font:700 1.15rem var(--hand)}.ccard .cbody{padding:10px 14px;font-size:.92rem}
+.ccard.new{padding:12px 14px;gap:8px;border-style:dashed;background:var(--paper)}.ccard.new input{padding:7px 9px}
+a.ccard:hover{box-shadow:0 4px 14px rgba(0,0,0,.15)}
+.banner{background:var(--cc);color:#fff;border-radius:10px;padding:22px 20px 16px;margin:6px 0 0;min-height:120px;
+ background-image:radial-gradient(circle at 92% 20%,rgba(255,255,255,.18) 0 60px,transparent 61px)}
+.banner h1{color:#fff;margin:0}.banner p{margin:.2em 0;opacity:.92}.banner .word b{font:700 1.25rem var(--hand);letter-spacing:.08em}
+.tabs{display:flex;gap:4px;border-bottom:2px solid var(--line);margin:10px 0 14px;overflow-x:auto}
+.tabs a{padding:8px 14px;text-decoration:none;color:var(--mut);font-weight:600;border-bottom:3px solid transparent;margin-bottom:-2px;white-space:nowrap}
+.tabs a.on{color:var(--ink);border-color:var(--pen)}
+a.card{display:block;color:var(--ink);text-decoration:none}a.card:hover{box-shadow:0 3px 10px rgba(0,0,0,.12)}
+.card.work{display:grid;grid-template-columns:1fr auto;gap:2px 14px;align-items:center}.card.work .mut{grid-column:1}.card.work>:last-child{grid-row:1/3;grid-column:2}
+.post.assign{border-left:4px solid var(--pencil-edge)}
+ul.todo,ul.people{padding-left:1.1em}ul.todo li,ul.people li{margin:.45em 0}
+table.grades th{text-align:left;font-size:.85rem;padding:6px 8px;vertical-align:bottom;border-bottom:2px solid var(--line)}table.grades td{padding:6px 8px}
+.v.pending{color:var(--q)}.gradebox{border-left:4px solid var(--ok)}.gradebox input{width:7em}
+"""
 
 # ---------- web ----------
 CSS = """
@@ -1095,7 +1314,7 @@ def page(title, body, refresh=False, side=""):
     again = ("<script>setInterval(()=>{if(!document.querySelector('.side.open')&&!document.hidden&&!getSelection().toString())"
              "location.reload()},15000)</script>") if refresh else ""
     return (f"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<title>{html.escape(title)}</title><style>{CSS}{DRAWER_CSS}</style></head><body><div class=wrap>{body}{FOOTER}</div>"
+            f"<title>{html.escape(title)}</title><style>{CSS}{DRAWER_CSS}{CLASSROOM_CSS}</style></head><body><div class=wrap>{body}{FOOTER}</div>"
             f"{side}{again}</body></html>")
 
 def e(s):
@@ -1340,9 +1559,7 @@ def teacher_panel(teacher, viewer, open_it=False, msg=""):
         body = (f"<h2>Staff room</h2><p>Logged in as <b>{e(teacher)}</b></p>"
                 "<form method=post action=/teacher/logout><button>Log out</button></form>"
                 f"<h3 style='margin-top:1.2em'>Classrooms</h3><ul>{cls or '<li class=mut>None yet.</li>'}</ul>"
-                "<form method=post action=/teacher/class class=row><input name=name placeholder='New class name' required>"
-                "<button>Make class</button></form><p class=mut>Each class gets a word. Students type it when they hand "
-                "in, with their name, and their work goes into your class.</p>"
+                "<p class=mut>Make classes on the home page. Each class gets a word; students join with it and their name.</p>"
                 f"<h3 style='margin-top:1.2em'>Your teacher work</h3><ul>{rows or '<li class=mut>None yet.</li>'}</ul>"
                 f"<h3>Student hints</h3><form method=post action=/teacher/settings class=card>"
                 f"<label class=mut>Score needed to earn a hint (%)<input name=hint_score type=number min=0 max=100 value={settings()['hint_score']}></label>"
@@ -1363,7 +1580,8 @@ def drawers(teacher, viewer, open_staff=False, msg=""):
     return student_panel(viewer, teacher) + teacher_panel(teacher, viewer, open_staff, msg) + DRAWER_JS
 
 HANDIN_FORM = """<details class='card handin' open><summary><b class=hand>Ready? Hand it in to your teacher</b></summary>
-<p class=mut>Keep practising as much as you like: nothing is sent to your teacher until you hand it in here.</p>
+<p class=mut>Keep practising as much as you like: nothing is sent to your teacher until you hand it in here.
+Tip: join your class on the home page and you won't need the class word each time.</p>
 <form method=post action='/handin/{ID}' id=handin-form data-title="{TITLE}">
 <div class=row><input name=classword id=hi-word placeholder='Class word from your teacher' autocomplete=off autocapitalize=characters required>
 <input name=student placeholder='Your name or student number' autocomplete=name required></div>
@@ -1466,10 +1684,12 @@ def home(viewer, teacher, msg="", staff_msg=""):
 
     return page("Homework Wizard", f"""<h1>{HAT}<span class=hl>Homework Wizard</span></h1>
 <div class=motto>It checks your homework. It doesn't do it for you.</div>
-<p class=mut>Hand in your own draft. Every claim gets checked against real sources, and your work comes back marked:
+{f"<div class='card add'><b class=hand>Note:</b> {e(msg)}</div>" if msg else ""}
+{class_cards(teacher, viewer)}
+<h2>{"Mark or check a paper" if teacher else "Practise"}</h2>
+<p class=mut>Practise with your own draft as often as you like. Every claim gets checked against real sources, and it comes back marked:
 what checks out, what to fix, and notes on how to make it stronger, with the sources to read. Marking takes
 20-60 minutes and papers are marked one at a time, so you can close this page and come back.</p>
-{f"<div class='card add'><b class=hand>Note:</b> {e(msg)}</div>" if msg else ""}
 <form method=post action=/new class=card enctype=multipart/form-data id=handin>
 <div class=row><input name=title placeholder="Title of your assignment" required>
 <label class=num>Extra topic ideas <input name=extra type=number min=0 max=6 value=3></label>{mode_pick}</div>
@@ -1478,7 +1698,7 @@ what checks out, what to fix, and notes on how to make it stronger, with the sou
 <label class="upload mut">…or upload it: Word (.docx), PDF, text file, or a photo of handwritten work
 <input type=file name=file accept=".docx,.pdf,.txt,.md,image/*"></label><p class=mut id=upnote></p>
 <p><button>✏️ Hand it in</button></p></form>{UPLOAD_JS}
-<h2>Your homework pile</h2><table>{rows or '<tr><td class=mut>Nothing handed in yet (only work handed in from this browser shows here).</td></tr>'}</table>
+<h2>Your papers</h2><table>{rows or '<tr><td class=mut>Nothing handed in yet (only work handed in from this browser shows here).</td></tr>'}</table>
 """, side=drawers(teacher, viewer, bool(staff_msg), staff_msg))
 
 TEACHER_SCRIPT = """<script>
@@ -1511,9 +1731,9 @@ def report(st, viewer=None, teacher=None):
     place = queue_place(st)
     claims = [c for s in st.get("sections", []) for c in s.get("claims", []) if "verdict" in c]
     tally = {v: sum(1 for c in claims if c["verdict"] == v) for v in MARKS}
-    score = (f"<div class=score>{tally['supported']}/{len(claims)} check out</div> <span class=mut>"
+    score_html = (f"<div class=score>{tally['supported']}/{len(claims)} check out</div> <span class=mut>"
              + " · ".join(f"{MARKS[v]}: {tally[v]}" for v in ("partly", "unclear", "contradicted")) + "</span>") if claims else ""
-    head = ((progress_bar(st) if running else "") + f"<p><a href='/'>← Back to the pile</a></p><h1>{e(st['title'])}</h1>{score}"
+    head = ((progress_bar(st) if running else "") + f"<p><a href='/'>← Back to the pile</a></p><h1>{e(st['title'])}</h1>{score_html}"
             f"<div class=stats><span>{STATUS.get(st['status'], e(st['status']))}"
             f"{f' · you are number {place} in the pile' if place else ''}</span>"
             f"<span>Original: {orig_words} words · {read_min(orig_words)} min</span>"
@@ -1538,15 +1758,46 @@ def report(st, viewer=None, teacher=None):
     if h:
         c = all_classes().get(h["classroom"], {})
         a = assignment(h["classroom"], h.get("assignment")) if h.get("assignment") else None
-        head += (f"<div class='card handed'><span class=stamp>Handed in</span>{'<span class="stamp late">Late</span>' if h.get('late') else ''}"
-                 f"<p>{e(h['student'])} handed this in to <b>{e(c.get('name', h['classroom']))}</b>"
+        pts = a.get("points", 100) if a else 100
+        mine_cls = bool(teacher) and h["classroom"] in classes_for(teacher)
+        head += (f"<div class='card handed'><span class=stamp>Turned in</span>{'<span class=\"stamp late\">Late</span>' if h.get('late') else ''}"
+                 + ("<span class=stamp style='color:var(--ok);border-color:var(--ok)'>Graded</span>" if h.get("returned") else "")
+                 + f"<p>{e(h['student'])} turned this in to <b><a href='/class/{h['classroom']}'>{e(c.get('name', h['classroom']))}</a></b>"
                  f"{' for <b>' + e(a['title']) + '</b>' if a else ''} on {time.strftime('%Y-%m-%d at %H:%M', time.localtime(h['at']))}"
-                 f"{' (handed in by a teacher)' if h.get('by_teacher') else ''}. It can't be changed or handed in again.</p>"
-                 + (f"<form method=post action='/handback/{st['id']}' onsubmit=\"return confirm('Hand this back? The student will be able to hand in again.')\">"
-                    "<button class=link>Hand it back (let them hand in again)</button></form>"
-                    if teacher and h["classroom"] in classes_for(teacher) else "") + "</div>")
+                 f"{' (by a teacher)' if h.get('by_teacher') else ''}. It can't be changed or turned in again.</p>")
+        if h.get("returned") and (mine_cls or st.get("owner") == viewer):
+            head += ((f"<p><b>Grade: {h['grade']}/{pts}</b></p>" if h.get("grade") is not None else "")
+                     + (f"<div class='card add'><b class=hand>Private comment from the teacher</b><p style='white-space:pre-wrap'>{e(h['comment'])}</p></div>" if h.get("comment") else ""))
+        if mine_cls:
+            g = h.get("grade") if h.get("grade") is not None else suggested_grade(st, pts)
+            head += (f"<form method=post action='/grade/{st['id']}' class='card gradebox'><b>{'Update grade' if h.get('returned') else 'Grade and return'}</b>"
+                     f"<p><label class=num>Grade <input name=grade type=number min=0 max={pts} step=any value='{g}'> / {pts}</label></p>"
+                     f"<p class=mut>Suggested from the marking score ({score(st) if score(st) is not None else '–'}% of claims checked out); change it as you like.</p>"
+                     f"<label class=mut>Private comment to the student<textarea name=comment style=min-height:90px>{e(h.get('comment', ''))}</textarea></label>"
+                     "<p><button>Return</button></p></form>"
+                     f"<form method=post action='/handback/{st['id']}' onsubmit=\"return confirm('Return this for a redo? The student will be able to turn in again.')\">"
+                     "<button class=link>Return for a redo (unlock it)</button></form>")
+        head += "</div>"
     elif is_student(st) and st.get("owner") == viewer and st["status"] == "done" and not teacher:
-        head += HANDIN_FORM.replace("{ID}", st["id"]).replace("{TITLE}", e(st["title"]))
+        mine = joined(viewer)
+        opts = ""
+        for code, name in mine.items():
+            c, jobs = all_classes()[code], class_jobs(code)
+            for a in reversed(c.get("assignments", [])):
+                if not work_for(jobs, a["id"], student_key(name)):
+                    opts += (f"<option value='{code}|{a['id']}'>{e(c['name'])}: {e(a['title'])}"
+                             f"{' (due ' + e(a['due']) + (', late' if is_late(a, time.time()) else '') + ')' if a.get('due') else ''}</option>")
+            opts += f"<option value='{code}|'>{e(c['name'])}: other work</option>"
+        if mine:
+            head += (f"<details class='card handin' open><summary><b class=hand>Ready? Turn it in</b></summary>"
+                     "<p class=mut>Keep practising as much as you like: nothing goes to your teacher until you turn it in.</p>"
+                     f"<form method=post action='/handin/{st['id']}' id=turnin-form><select name=target required>{opts}</select>"
+                     "<label class=sure><input type=checkbox name=sure value=1 required> I'm ready. I understand that once it's turned in I can't change it or turn it in again.</label>"
+                     "<p><button>Turn in</button></p></form></details>"
+                     "<script>document.getElementById('turnin-form').addEventListener('submit',ev=>{const o=ev.target.target.selectedOptions[0];"
+                     "if(!confirm('Turn in to '+o.text+'? You won\\'t be able to change it or turn it in again.'))ev.preventDefault()})</script>")
+        else:
+            head += HANDIN_FORM.replace("{ID}", st["id"]).replace("{TITLE}", e(st["title"]))
     award = st.get("hint_award")
     if award and st.get("owner") == viewer:
         head += (f"<div class='card add'><b class=hand>{'Nice work!' if award['earned'] else 'Handed in.'}</b> You scored {award['score']}%"
@@ -1675,10 +1926,11 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(info or {"error": "No class uses that word. Check the spelling with your teacher."}),
                              "application/json")
         m = re.match(r"^/class/([A-Z0-9-]{4,12})(?:/(s|a)/(.+))?$", p)
-        if m and teacher:
+        if m:
             code, kind, arg = m.group(1), m.group(2), urllib.parse.unquote(m.group(3) or "")
-            out = (student_page(code, arg, teacher, vid) if kind == "s" else assignment_page(code, arg, teacher, vid)
-                   if kind == "a" else class_page(code, teacher, vid))
+            tab = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("tab", ["stream"])[0]
+            out = (student_profile(code, arg, teacher, vid) if kind == "s" and teacher else assignment_view(code, arg, teacher, vid)
+                   if kind == "a" else class_view(code, tab, teacher, vid) if not kind else None)
             if out:
                 return self.send(200, out)
         m = re.match(r"^/job/([0-9a-f]+)(\.json)?$", p)
@@ -1720,7 +1972,12 @@ class H(BaseHTTPRequestHandler):
                 return self.send(404, "not found")
             if f("sure") != "1":
                 return self.send(400, page("Hand in", "<p>Tick the box to say you're ready. <a href='javascript:history.back()'>Back</a></p>"))
-            err = hand_in(st["id"], re.sub(r"[^A-Z0-9-]", "", f("classword").upper())[:12], f("assignment"), f("student"))
+            if f("target"):   # a joined student picking one of their classes
+                code, aid = (f("target").split("|", 1) + [""])[:2]
+                name = joined(vid).get(code)
+                err = hand_in(st["id"], code, aid, name) if name else "You aren't in that class on this device. Join it on the home page first."
+            else:
+                err = hand_in(st["id"], re.sub(r"[^A-Z0-9-]", "", f("classword").upper())[:12], f("assignment"), f("student"))
             if err:
                 return self.send(400, page("Hand in", f"<div class='card add'><b class=hand>Not handed in:</b> {e(err)}</div>"
                                            f"<p><a href='/job/{st['id']}'>← Back to your paper</a></p>"))
@@ -1731,13 +1988,75 @@ class H(BaseHTTPRequestHandler):
             if st and st.get("handin") and st["handin"]["classroom"] in classes_for(teacher):
                 hand_back(st["id"])
             return self.send(303, "", loc=f"/job/{m.group(1)}")
-        m = re.match(r"^/class/([A-Z0-9-]{4,12})/assign$", self.path)
-        if m and teacher:
-            add_assignment(teacher, m.group(1), f("title"), f("due"))
-            return self.send(303, "", loc=f"/class/{m.group(1)}")
+        if self.path == "/join":
+            code, err = join_class(vid, f("classword"), f("name"))
+            return self.send(303, "", loc=f"/class/{code}") if code else self.send(400, home(vid, teacher, err))
         if self.path == "/teacher/class" and teacher:
-            code = create_class(teacher, f("name"))
+            code = create_class(teacher, f("name"), f("section"))
             return self.send(303, "", loc=f"/class/{code}")
+        m = re.match(r"^/grade/([0-9a-f]+)$", self.path)
+        if m and teacher:
+            st = self.job(m.group(1), teacher)
+            if st and st.get("handin") and st["handin"]["classroom"] in classes_for(teacher):
+                a = assignment(st["handin"]["classroom"], st["handin"].get("assignment"))
+                try:
+                    g = max(0.0, min(float(a.get("points", 100) if a else 100), float(f("grade"))))
+                    g = int(g) if g == int(g) else round(g, 1)
+                except ValueError:
+                    g = None
+                grade_work(st["id"], g, f("comment"))
+            return self.send(303, "", loc=f"/job/{m.group(1)}")
+        m = re.match(r"^/class/([A-Z0-9-]{4,12})/(assign|post|leave|post/[0-9a-f]+/delete|a/[0-9a-f]+/delete|a/[0-9a-f]+/turnin|remove/.+)$", self.path)
+        if m:
+            code, act = m.group(1), m.group(2)
+            owner = bool(teacher) and code in classes_for(teacher)
+            back = f"/class/{code}"
+            if act == "leave":
+                leave_class(vid, code)
+                return self.send(303, "", loc="/")
+            if act.endswith("/turnin"):
+                aid, name = act.split("/")[1], joined(vid).get(code)
+                st = self.job(f("job"), teacher) if re.fullmatch(r"[0-9a-f]{12,32}", f("job")) else None
+                if not name or not st or st.get("owner") != vid or not is_student(st) or st["status"] != "done":
+                    return self.send(400, page("Turn in", "<p>Pick one of your marked papers. <a href='javascript:history.back()'>Back</a></p>"))
+                if f("sure") != "1":
+                    return self.send(400, page("Turn in", "<p>Tick the box to say you're ready. <a href='javascript:history.back()'>Back</a></p>"))
+                err = hand_in(st["id"], code, aid, name)
+                if err:
+                    return self.send(400, page("Turn in", f"<div class='card add'><b class=hand>Not turned in:</b> {e(err)}</div><p><a href='{back}/a/{aid}'>← Back</a></p>"))
+                return self.send(303, "", loc=f"{back}/a/{aid}")
+            if not owner:
+                return self.send(404, "not found")
+            if act == "assign":
+                aid = secrets.token_hex(4)
+                pts = max(1, min(1000, int(f("points", "100") or 100))) if f("points", "100").isdigit() else 100
+                new = {"id": aid, "title": " ".join(f("title").split())[:120] or "Assignment", "instructions": f("instructions").strip()[:8000],
+                       "points": pts, "due": f("due") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", f("due")) else "",
+                       "topic": " ".join(f("topic").split())[:60], "created": time.strftime("%Y-%m-%d"),
+                       "links": [u.strip() for u in f("links").splitlines() if re.match(r"https?://\S+$", u.strip())][:10]}
+                def add(c):
+                    c.setdefault("assignments", []).append(new)
+                    c.setdefault("posts", []).append({"id": secrets.token_hex(4), "aid": aid, "at": time.time(), "by": teacher})
+                update_class(code, add)
+                return self.send(303, "", loc=f"{back}?tab=classwork")
+            if act == "post":
+                if f("text").strip():
+                    update_class(code, lambda c: c.setdefault("posts", []).append(
+                        {"id": secrets.token_hex(4), "text": f("text").strip()[:8000], "at": time.time(), "by": teacher}))
+                return self.send(303, "", loc=back)
+            if act.startswith("post/"):
+                pid = act.split("/")[1]
+                update_class(code, lambda c: c.update(posts=[x for x in c.get("posts", []) if x["id"] != pid]))
+                return self.send(303, "", loc=back)
+            if act.startswith("a/"):
+                aid = act.split("/")[1]
+                update_class(code, lambda c: c.update(assignments=[x for x in c.get("assignments", []) if x["id"] != aid],
+                                                      posts=[x for x in c.get("posts", []) if x.get("aid") != aid]))
+                return self.send(303, "", loc=f"{back}?tab=classwork")
+            if act.startswith("remove/"):
+                key = urllib.parse.unquote(act.split("/", 1)[1])
+                update_class(code, lambda c: c.get("roster", {}).pop(key, None))
+                return self.send(303, "", loc=f"{back}?tab=people")
         if self.path == "/teacher":
             ip = (self.headers.get(IP_HEADER, "") if IP_HEADER else "").strip() or self.client_address[0]
             if lock_left(ip):
@@ -1816,6 +2135,8 @@ class H(BaseHTTPRequestHandler):
                 st["handin"] = {"classroom": classroom, "assignment": aid, "student": student, "at": time.time(),
                                 "late": is_late(assignment(classroom, aid), time.time()) if aid else False,
                                 "hints_used": 0, "by_teacher": teacher}
+                update_class(classroom, lambda c: c.setdefault("roster", {}).setdefault(
+                    student_key(student), {"name": student, "joined": time.strftime("%Y-%m-%d")}))
             if images:
                 st["ocr_files"], st["typed"], st["step"] = [], text, "ocr"
                 for i, img in enumerate(images[:MAX_PAGES], 1):
