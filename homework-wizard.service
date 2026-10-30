@@ -1,0 +1,13 @@
+[Unit]
+Description=Homework Wizard (draft fact-check + expand, local LLM)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/homework-wizard/homework_wizard.py
+Environment=DATA_DIR=/var/lib/homework-wizard/jobs
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Ollama, CPU only (second instance for Homework Wizard)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment=HOME=/usr/share/ollama
+Environment=OLLAMA_HOST=127.0.0.1:11436
+Environment=CUDA_VISIBLE_DEVICES=-1
+Environment=OLLAMA_KEEP_ALIVE=10m
+Environment=OLLAMA_MAX_LOADED_MODELS=1
+Environment=OLLAMA_NUM_PARALLEL=1
+Nice=15
+
+[Install]
+WantedBy=multi-user.target
