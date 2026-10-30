@@ -28,10 +28,8 @@ students, no paid API, no student data sent to an AI company.
 
 ## Teacher mode
 Anyone who isn't logged in uses student mode. Teachers log in with their email and password (the **Staff room**
-drawer on the right) and get teacher mode as well: it also drafts sourced additions and new sections in the
-writer's voice as tick-box suggestions, and **Build final text** assembles the draft, the ticked parts and a source
-list. Handy for model answers, worksheets and the teacher's own writing. Teacher-mode jobs are only visible to
-logged-in teachers; students never see the option. The Staff room also lists the teacher's work and holds the hint
+drawer on the right) and get the teacher tools: classes, assignments, handed-in work, the AI-writing scan and Author mode.
+Students never see any of it. The Staff room also lists the teacher's work and holds the hint
 settings (score needed to earn a hint, hints a new student starts with).
 
 The school adds teachers on the server:
@@ -45,19 +43,33 @@ Run it with the same `DATA_DIR` (or `TEACHERS_FILE`) as the server. Passwords ar
 locked out for 1 hour. Behind a reverse proxy, set `CLIENT_IP_HEADER` (see below) or every visitor shares the proxy's
 address and one student's wrong guesses would lock everyone out.
 
+## How homework flows
+1. **Students practise freely.** Every draft they hand in to the site is marked just for them; teachers see none of it.
+2. **They hand it in when they're ready.** On a marked paper: type the **class word** from the teacher, pick the
+   assignment, type their name or student number, and confirm. The paper gets a **Handed in** stamp (and **Late** after
+   the due date), is locked, and can't be handed in again; the same student can't hand in twice for one assignment.
+3. **Teachers see handed-in work** per class and per assignment: who handed in and when, late ones, scores, hints
+   used, AI-scan results, and who hasn't handed in yet. **Hand back** reopens a paper so the student can hand in again.
+4. **Hints** are earned when a paper is handed in with a good score, not for practice drafts.
+
 ## Classrooms, profiles and the AI-writing scan (teachers)
-- **Classrooms:** make a class in the Staff room and it gets a code (like `SCI-7K3Q`). When you hand in a student's
-  paper, pick the class and type the student's name or number. Students don't log in; profiles come from what
-  teachers hand in.
-- **Class page:** class average, papers, and per student: papers, average, latest score with trend, reading level
-  and AI-scan flags. **Student page:** every paper with score, words, reading level and AI-scan result.
-- **What to do with a paper:** mark it, mark it and scan for AI writing, AI scan only (fast, no web research), or
-  teacher draft help.
+- **Classrooms:** make a class in the Staff room and it gets a **class word** (5 to 7 letters, like `OTTER`). Add
+  assignments with optional due dates on the class page. Teachers can also hand in a student's paper themselves
+  (pick the class and assignment, type the student's name).
+- **Class page:** class average, assignments (handed in, late, average), and per student: papers, average, latest
+  score with trend, reading level and AI-scan flags. **Student page:** every handed-in paper with score, words,
+  reading level and AI-scan result.
+- **What to do with a paper (teacher form):** mark it, mark it and scan for AI writing, or AI scan only (fast, no web
+  research). Any paper a teacher opens also has a **Scan for AI writing** button.
 - **AI-writing scan:** signals, not a verdict. It looks at sentence rhythm, stock AI phrases, personal voice,
   paragraph sizes, the local model's read (with quoted passages), and, the most useful one, how much the paper differs
   from the same student's earlier papers in that class. Result: few / some / strong signs, each reason shown.
   **No AI detector is reliable** (they often wrongly flag English learners and formal writing), so use it to start a
   conversation, never as proof.
+
+## Author mode (logged-in teachers)
+For your own writing: it fact-checks your article and drafts sourced additions and new sections in your voice as
+tick-box suggestions, then **Write out the clean copy** assembles the draft, the ticked parts and a source list.
 
 ## Uploads and photos
 The hand-in form takes a Word file (.docx), a PDF, a text file, or a photo or scan of handwritten work. Text from

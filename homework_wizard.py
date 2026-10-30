@@ -339,7 +339,6 @@ def run_job(jid):
              "aiscan": step_aiscan}[st["step"]](st)
             steps = steps_for(st)
             st["step"] = steps[steps.index(st["step"]) + 1]; save(st)
-        award_hint(st)
         st["status"] = "done"; st["finished"] = time.time()
         log(st, f"finished in {round((st['finished'] - st['created']) / 60)} min")
     except Exception as e:
@@ -475,7 +474,7 @@ def session_teacher(cookie):
 
 # ---------- hints: earned by good scores, spent on a highlighted part of a marked paper ----------
 MAX_HINTS = 3
-file_lock = threading.Lock()
+file_lock = threading.RLock()   # re-entrant: hand_in holds it while award_hint updates the wallet
 
 def read_json(path, default):
     try:
@@ -517,7 +516,7 @@ def score(st):
     return round(100 * sum(c["verdict"] == "supported" for c in claims) / len(claims)) if claims else None
 
 def award_hint(st):
-    """A marked student paper scoring at least the teacher's threshold earns one hint (once per paper)."""
+    """A student paper handed in with at least the teacher's threshold score earns one hint (once per paper)."""
     pct, need = score(st), settings()["hint_score"]
     if not is_student(st) or not st.get("owner") or st.get("by_teacher") or pct is None or st.get("hint_award"):
         return
@@ -784,6 +783,22 @@ def ai_scan(st):
     return {"level": "strong" if points >= 6 else "some" if points >= 3 else "low", "points": points,
             "signals": signals, "signs": model["signs"], "stats": s}
 
+def scan_later(jid):
+    """Teacher asked for an AI-writing scan of an already marked paper: run it in the background."""
+    with file_lock:
+        st = load(jid)
+    try:
+        result = ai_scan(st)
+    except Exception as ex:
+        result = None
+        print(jid, "AI scan failed:", repr(ex), flush=True)
+    with file_lock:
+        st = load(jid)
+        st.pop("ai_pending", None)
+        if result:
+            st["ai"] = result
+        save(st)
+
 def step_aiscan(st):
     st["ai"] = ai_scan(st)
     log(st, f"AI-writing scan: {st['ai']['level']} ({st['ai']['points']} points)")
@@ -809,7 +824,20 @@ def ai_card(st):
 
 
 # ---------- classrooms + student profiles (teachers hand in work with a class and a student name/number) ----------
-CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+# class words: easy for students to type; 5 to 7 letters
+CLASS_WORDS = """acorn apple badger bagel banjo beacon beaver bison blossom bonsai breeze bridge bubble buffalo button cactus
+camel canoe canyon carrot castle cedar cherry chimney clover cobalt comet compass condor coral cotton coyote
+crayon cricket crystal cupcake dolphin dragon eagle eclipse ember falcon feather ferret fiddle forest fossil garden
+gecko geyser ginger glacier goblin gopher granite grape gravity griffin guitar hamster harbor hazel heron hickory
+honey hornet husky iguana island jaguar jasmine jelly jigsaw jungle kayak kernel kettle kitten koala ladder
+lagoon lantern lemon lentil lilac lizard lobster locket lotus magnet mango maple marble meadow melon meteor
+mitten monkey mosaic muffin narwhal nectar nickel noodle nutmeg oasis ocean octopus olive onion orange orbit
+orchid osprey otter oyster paddle panda papaya parrot peach peanut pebble pelican pepper pickle pigeon pillow
+pirate planet pocket poppy pretzel prism puffin pumpkin puzzle python quartz quokka rabbit raccoon radar radish
+rainbow raven riddle river robin rocket saddle salmon sandal scarf season sequoia shadow sherpa shovel silver
+sketch sloth snail sparrow sphinx spider spruce squash squid summit sunset sushi swallow tablet tadpole tiger
+timber tomato topaz tornado toucan tractor trumpet tulip tundra turkey turnip turtle tuxedo uncle unicorn valley
+velvet violet viper volcano waffle walnut walrus whale wizard wombat yogurt zebra zephyr zipper""".split()
 
 def all_classes():
     return read_json(CLASSES_FILE, {})
@@ -820,17 +848,78 @@ def classes_for(teacher):
 def create_class(teacher, name):
     with file_lock:
         classes = all_classes()
-        prefix = (re.sub(r"[^A-Z]", "", name.upper()) + "CLS")[:3]
-        while True:
-            code = prefix + "-" + "".join(secrets.choice(CODE_CHARS) for _ in range(4))
-            if code not in classes:
-                break
+        free = [w.upper() for w in CLASS_WORDS if w.upper() not in classes]
+        code = secrets.choice(free) if free else None
+        while not code or code in classes:   # every word taken: add two digits
+            code = secrets.choice(CLASS_WORDS).upper() + str(secrets.randbelow(90) + 10)
         classes[code] = {"name": name.strip()[:80] or code, "teacher": teacher, "created": time.strftime("%Y-%m-%d")}
         write_json(CLASSES_FILE, classes)
     return code
 
 def student_key(name):
     return " ".join(name.lower().split())[:80]
+
+def add_assignment(teacher, code, title, due):
+    with file_lock:
+        classes = all_classes()
+        c = classes.get(code)
+        if not c or c.get("teacher") != teacher:
+            return None
+        aid = secrets.token_hex(4)
+        c.setdefault("assignments", []).append({"id": aid, "title": " ".join(title.split())[:120] or "Assignment",
+                                                "due": due if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due or "") else "",
+                                                "created": time.strftime("%Y-%m-%d")})
+        write_json(CLASSES_FILE, classes)
+    return aid
+
+def assignment(code, aid):
+    return next((a for a in all_classes().get(code, {}).get("assignments", []) if a["id"] == aid), None)
+
+def is_late(a, when):
+    return bool(a and a.get("due")) and time.strftime("%Y-%m-%d", time.localtime(when)) > a["due"]
+
+def class_info(word):
+    code = re.sub(r"[^A-Z0-9-]", "", word.upper())[:12]
+    c = all_classes().get(code)
+    if not c:
+        return None
+    return {"code": code, "name": c["name"],
+            "assignments": [{"id": a["id"], "title": a["title"], "due": a.get("due", ""), "late": is_late(a, time.time())}
+                            for a in reversed(c.get("assignments", []))]}
+
+def hand_in(jid, code, aid, student, by_teacher=None):
+    """Lock a paper into a class (and assignment). Returns an error message, or "" when it worked."""
+    student = " ".join(student.split())[:80]
+    if not student:
+        return "Type your name or student number so your teacher knows it's yours."
+    if code not in all_classes():
+        return f"No class uses the word {code}. Check the spelling with your teacher."
+    a = assignment(code, aid) if aid else None
+    if aid and not a:
+        return "That assignment isn't in this class any more. Pick another one."
+    key = student_key(student)
+    with file_lock:
+        st = load(jid)
+        if st.get("handin"):
+            return "This paper has already been handed in."
+        if aid and any(j.get("classroom") == code and j.get("student_key") == key and (j.get("handin") or {}).get("assignment") == aid
+                       for j in all_jobs()):
+            return (f"{student} has already handed in “{a['title']}”. If you need to hand in a new version, ask your teacher "
+                    "to hand the first one back.")
+        now = time.time()
+        st["handin"] = {"classroom": code, "assignment": aid, "student": student, "at": now, "late": is_late(a, now),
+                        "hints_used": len(st.get("hints", [])), "by_teacher": by_teacher}
+        st.update(classroom=code, student=student, student_key=key)
+        award_hint(st)
+        save(st)
+    return ""
+
+def hand_back(jid):
+    with file_lock:
+        st = load(jid)
+        for k in ("handin", "classroom", "student", "student_key"):
+            st.pop(k, None)
+        save(st)
 
 def paper_row(j):
     sc = score(j)
@@ -866,15 +955,56 @@ def class_page(code, teacher, viewer):
                  f"<td>{last_grade}</td><td>{flags or ''}</td></tr>")
     ca = avg([score(j) for j in marked])
     body = (f"<p><a href='/'>← Back to the pile</a></p><h1>{e(c['name'])}</h1>"
-            f"<p>Class code <b class=hand style='font-size:1.3rem'>{code}</b></p>"
+            f"<p>Class word <b class=hand style='font-size:1.6rem;letter-spacing:.08em'>{code}</b> "
+            "<span class=mut>· students type this word when they hand in, and their work lands here.</span></p>"
             f"<div class=stats><span>{len(people)} students</span><span>{len(jobs)} papers</span>"
             f"<span>Class average: {f'{ca}%' if ca is not None else '–'}</span>"
             f"<span>Avg reading level: {avg([text_stats(j['text'])['grade'] for j in marked if j.get('text')]) or '–'}</span></div>"
+            + assignments_block(code, c, jobs) +
             "<h2>Students</h2><div style=overflow-x:auto><table><tr class=mut><td>Student</td><td>Papers</td><td>Average</td>"
-            f"<td>Latest</td><td>Reading level</td><td>AI flags</td></tr>{rows or '<tr><td class=mut colspan=6>No papers yet. Hand in work with this class picked.</td></tr>'}</table></div>"
+            f"<td>Latest</td><td>Reading level</td><td>AI flags</td></tr>{rows or '<tr><td class=mut colspan=6>Nothing handed in yet.</td></tr>'}</table></div>"
             "<p class=mut>Scores are the share of checked claims that held up. AI flags count papers with some or strong signs; "
             "open the paper to see why, and remember they are not proof.</p>")
     return page(c["name"], body, side=drawers(teacher, viewer))
+
+def assignments_block(code, c, jobs):
+    rows = ""
+    for a in reversed(c.get("assignments", [])):
+        got = [j for j in jobs if (j.get("handin") or {}).get("assignment") == a["id"]]
+        late = sum(1 for j in got if j["handin"].get("late"))
+        av = avg([score(j) for j in got])
+        rows += (f"<tr><td><a href='/class/{code}/a/{a['id']}'>{e(a['title'])}</a></td><td>{e(a.get('due') or '–')}</td>"
+                 f"<td>{len(got)}</td><td>{late or ''}</td><td>{f'{av}%' if av is not None else '–'}</td></tr>")
+    return ("<h2>Assignments</h2><div style=overflow-x:auto><table><tr class=mut><td>Assignment</td><td>Due</td><td>Handed in</td>"
+            f"<td>Late</td><td>Average</td></tr>{rows or '<tr><td class=mut colspan=5>No assignments yet.</td></tr>'}</table></div>"
+            f"<form method=post action='/class/{code}/assign' class='card row'><input name=title placeholder='New assignment, e.g. Volcano report' required>"
+            "<label class=num>Due <input name=due type=date style=width:auto></label><button>Add assignment</button></form>")
+
+def assignment_page(code, aid, teacher, viewer):
+    c, a = classes_for(teacher).get(code), assignment(code, aid)
+    if not c or not a:
+        return None
+    jobs = [j for j in all_jobs() if j.get("classroom") == code]
+    got = sorted([j for j in jobs if (j.get("handin") or {}).get("assignment") == aid], key=lambda j: j["handin"]["at"])
+    rows = ""
+    for j in got:
+        h, sc, ai = j["handin"], score(j), (j.get("ai") or {}).get("level")
+        rows += (f"<tr><td>{e(h['student'])}</td><td><a href='/job/{j['id']}'>{e(j['title'])}</a></td>"
+                 f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(h['at']))}</td>"
+                 f"<td>{'<span class="v contradicted">late</span>' if h.get('late') else ''}</td>"
+                 f"<td>{f'{sc}%' if sc is not None else '–'}</td><td>{h.get('hints_used', 0) or ''}</td>"
+                 + ("<td><span class='v %s'>%s</span></td>" % (AI_LEVEL[ai][0], ai) if ai else "<td>–</td>") + "</tr>")
+    handed = {j["student_key"] for j in got}
+    missing = sorted({j.get("student", j["student_key"]) for j in jobs if j["student_key"] not in handed})
+    av = avg([score(j) for j in got])
+    body = (f"<p><a href='/class/{code}'>← {e(c['name'])}</a></p><h1>{e(a['title'])}</h1>"
+            f"<div class=stats><span>Due: {e(a.get('due') or 'no due date')}</span><span>{len(got)} handed in</span>"
+            f"<span>{sum(1 for j in got if j['handin'].get('late'))} late</span><span>Average: {f'{av}%' if av is not None else '–'}</span></div>"
+            "<div style=overflow-x:auto><table><tr class=mut><td>Student</td><td>Paper</td><td>Handed in</td><td></td><td>Score</td>"
+            f"<td>Hints used</td><td>AI scan</td></tr>{rows or '<tr><td class=mut colspan=7>Nothing handed in yet.</td></tr>'}</table></div>"
+            + (f"<h2>Not handed in yet</h2><p>{', '.join(e(n) for n in missing)}</p><p class=mut>Students who have handed in other "
+               "work to this class but not this assignment.</p>" if missing else ""))
+    return page(a["title"], body, side=drawers(teacher, viewer))
 
 def student_page(code, key, teacher, viewer):
     c = classes_for(teacher).get(code)
@@ -1019,7 +1149,11 @@ button.side-tab.left{left:0;transform:translateY(-50%);border-radius:0 12px 12px
 .checks label{display:flex;gap:8px;align-items:flex-start;color:var(--ink);font-size:.93rem}.checks input{width:auto;margin-top:5px}
 .timer{font:700 2.4rem/1.1 ui-monospace,monospace;text-align:center;margin:6px 0}
 .cv{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-label.upload{display:block;margin:.2em 0}label.upload input{margin-top:6px;background:transparent;border-style:dashed}
+label.upload{display:block;margin:.2em 0}
+.handin{border:2px dashed var(--pen)}.handin select{margin:.4em 0}label.sure{display:flex;gap:8px;align-items:flex-start;margin:.6em 0}
+label.sure input{width:auto;margin-top:5px}
+.stamp{display:inline-block;font:700 1.1rem var(--hand);color:var(--pen);border:3px double var(--pen);padding:.1em .6em;
+ transform:rotate(-6deg);text-transform:uppercase;letter-spacing:.08em;margin:.2em .6em .4em 0}.stamp.late{color:var(--half);border-color:var(--half)}label.upload input{margin-top:6px;background:transparent;border-style:dashed}
 .aiscan{border-left:4px solid var(--half)}.aiscan summary .v{margin-left:.6em}
 .star{color:var(--pencil-edge);font-size:1.2rem;letter-spacing:.1em}.star.off{color:var(--line)}
 .hintbox{background:var(--paper)}.hintbox p{margin:.3em 0}
@@ -1207,16 +1341,19 @@ def teacher_panel(teacher, viewer, open_it=False, msg=""):
                 "<form method=post action=/teacher/logout><button>Log out</button></form>"
                 f"<h3 style='margin-top:1.2em'>Classrooms</h3><ul>{cls or '<li class=mut>None yet.</li>'}</ul>"
                 "<form method=post action=/teacher/class class=row><input name=name placeholder='New class name' required>"
-                "<button>Make class</button></form>"
+                "<button>Make class</button></form><p class=mut>Each class gets a word. Students type it when they hand "
+                "in, with their name, and their work goes into your class.</p>"
                 f"<h3 style='margin-top:1.2em'>Your teacher work</h3><ul>{rows or '<li class=mut>None yet.</li>'}</ul>"
                 f"<h3>Student hints</h3><form method=post action=/teacher/settings class=card>"
                 f"<label class=mut>Score needed to earn a hint (%)<input name=hint_score type=number min=0 max=100 value={settings()['hint_score']}></label>"
                 f"<label class=mut>Hints a new student starts with (0-{MAX_HINTS})<input name=start_hints type=number min=0 max={MAX_HINTS} value={settings()['start_hints']}></label>"
                 "<p><button>Save</button></p></form>"
                 "<h3>How teacher mode works</h3><ul class=mut><li>Pick what to do in the form: mark it, mark it and scan for "
-                "AI writing, scan only, or teacher draft help. Pick a class and type the student's name or number to build their profile.</li>"
-                "<li>You get sourced additions and new sections as tick-box suggestions, then <b>Write out the clean copy</b>.</li>"
-                "<li>Students never see teacher mode, and teacher work only opens while you are logged in.</li>"
+                "AI writing, or scan only. Pick a class and type the student's name or number to build their profile.</li>"
+                "<li><b>Author mode</b> is for your own writing: it fact-checks your article and drafts sourced additions "
+                "and new sections in your voice.</li>"
+                "<li>In author mode you get the additions and new sections as tick-box suggestions, then <b>Write out the clean copy</b>.</li>"
+                "<li>Students never see teacher or author mode, and that work only opens while you are logged in.</li>"
                 "<li>Logins last 30 days on this device. 3 wrong passwords lock that address out for 1 hour.</li></ul>")
     return (f"<aside class='side right' id=side-staff aria-label='Staff room' aria-hidden=true{' data-open' if open_it else ''}>{body}</aside>"
             "<button class='side-tab right' type=button aria-controls=side-staff aria-expanded=false aria-label='Open the staff room'>"
@@ -1225,8 +1362,28 @@ def teacher_panel(teacher, viewer, open_it=False, msg=""):
 def drawers(teacher, viewer, open_staff=False, msg=""):
     return student_panel(viewer, teacher) + teacher_panel(teacher, viewer, open_staff, msg) + DRAWER_JS
 
+HANDIN_FORM = """<details class='card handin' open><summary><b class=hand>Ready? Hand it in to your teacher</b></summary>
+<p class=mut>Keep practising as much as you like: nothing is sent to your teacher until you hand it in here.</p>
+<form method=post action='/handin/{ID}' id=handin-form data-title="{TITLE}">
+<div class=row><input name=classword id=hi-word placeholder='Class word from your teacher' autocomplete=off autocapitalize=characters required>
+<input name=student placeholder='Your name or student number' autocomplete=name required></div>
+<p class=mut id=hi-class></p>
+<select name=assignment id=hi-assign disabled><option value=''>Type your class word first</option></select>
+<label class=sure><input type=checkbox name=sure value=1 required> I'm ready. I understand that once it's handed in I can't change it or hand it in again.</label>
+<p><button>Hand it in</button></p></form></details>
+<script>
+(()=>{const w=document.getElementById('hi-word'),sel=document.getElementById('hi-assign'),info=document.getElementById('hi-class');let t;
+w.addEventListener('input',()=>{clearTimeout(t);t=setTimeout(async()=>{const v=w.value.trim();if(v.length<4){sel.disabled=true;info.textContent='';return}
+ const r=await(await fetch('/classinfo?w='+encodeURIComponent(v))).json();
+ if(r.error){info.textContent=r.error;sel.disabled=true;sel.innerHTML="<option value=''>Type your class word first</option>";return}
+ info.innerHTML='Class: <b></b>';info.querySelector('b').textContent=r.name;
+ sel.innerHTML=r.assignments.map(a=>`<option value="${a.id}">${a.title.replace(/[&<>"]/g,'')}${a.due?' (due '+a.due+(a.late?', late':'')+')':''}</option>`).join('')+"<option value=''>Other work (no assignment)</option>";
+ sel.disabled=false},400)});
+document.getElementById('handin-form').addEventListener('submit',ev=>{const a=sel.options[sel.selectedIndex];
+ if(!confirm('Hand in “'+ev.target.dataset.title+'” for '+(a&&a.value?a.text:'other work')+'? You won\\'t be able to change it or hand it in again.'))ev.preventDefault()});})();
+</script>"""
 TASK = {("student", False): "marking", ("student", True): "marking + AI scan", ("scan", False): "AI scan",
-        ("teacher", False): "teacher draft"}
+        ("teacher", False): "author", ("author", False): "author"}
 UPLOAD_JS = """<script>
 (()=>{const f=document.querySelector('#handin input[type=file]'),ta=document.querySelector('#handin textarea'),note=document.getElementById('upnote');
 document.getElementById('handin').addEventListener('submit',ev=>{if(!ta.value.trim()&&!f.files.length){ev.preventDefault();note.textContent='Paste your draft or pick a file first.'}});
@@ -1289,21 +1446,24 @@ def home(viewer, teacher, msg="", staff_msg=""):
     rows = "".join(
         f"<tr><td><a href='/job/{s['id']}'>{e(s['title'])}</a></td><td>{TASK.get((s.get('mode'), bool(s.get('aiscan'))), 'student')}"
         f"{' · ' + e(s['student']) if s.get('student') else ''}</td>"
-        f"<td>{STATUS.get(s['status'], e(s['status']))}{f' {progress(s)[0]}%' if s['status'] == 'running' else ''}</td>"
+        f"<td>{'Handed in ✓' if s.get('handin') else STATUS.get(s['status'], e(s['status']))}{f' {progress(s)[0]}%' if s['status'] == 'running' else ''}</td>"
         f"<td class=mut>{time.strftime('%Y-%m-%d %H:%M', time.localtime(s['created']))}</td></tr>" for s in mine)
     mode_pick, teacher_row = "", ""
     if teacher:
         mode_pick = ("<select name=task><option value=mark>Mark it (student feedback)</option>"
                      "<option value=markscan>Mark it + scan for AI writing</option>"
                      "<option value=scan>Scan for AI writing only (fast)</option>"
-                     "<option value=teacher>Teacher draft help (sourced additions)</option></select>")
+                     "<option value=author>Author mode: flesh out and fact-check my own article</option></select>")
         mine_cls = classes_for(teacher)
         names = sorted({j.get("student", "") for j in all_jobs() if j.get("classroom") in mine_cls and j.get("student")})
-        teacher_row = ("<div class=row><select name=classroom><option value=''>No class</option>"
-                       + "".join(f"<option value={c}>{e(v['name'])} ({c})</option>" for c, v in sorted(mine_cls.items(), key=lambda x: x[1]["name"]))
+        opts = "".join(f"<optgroup label='{e(v['name'])} ({c})'><option value='{c}|'>{e(v['name'])}: other work</option>"
+                       + "".join(f"<option value='{c}|{a['id']}'>{e(v['name'])}: {e(a['title'])}</option>" for a in reversed(v.get("assignments", [])))
+                       + "</optgroup>" for c, v in sorted(mine_cls.items(), key=lambda x: x[1]["name"]))
+        teacher_row = ("<div class=row><select name=target><option value=''>Not for a class</option>" + opts
                        + "</select><input name=student list=students placeholder='Student name or number' autocomplete=off>"
                        + "<datalist id=students>" + "".join(f"<option value='{e(n)}'>" for n in names) + "</datalist></div>"
                        + ("" if mine_cls else "<p class=mut>Make a class in the Staff room to build student profiles.</p>"))
+
     return page("Homework Wizard", f"""<h1>{HAT}<span class=hl>Homework Wizard</span></h1>
 <div class=motto>It checks your homework. It doesn't do it for you.</div>
 <p class=mut>Hand in your own draft. Every claim gets checked against real sources, and your work comes back marked:
@@ -1367,11 +1527,29 @@ def report(st, viewer=None, teacher=None):
         head += "<p class=mut>This paper was read from a photo or scan. If something looks wrong, it may be a reading mistake.</p>"
     if teacher:
         head += ai_card(st)
+        if st.get("ai_pending"):
+            head += "<div class='card aiscan'><b>AI-writing scan</b> <span class=mut>Scanning… this takes a minute or two.</span></div>"
+        elif st["status"] == "done" and not st.get("ai") and st.get("text"):
+            head += (f"<form method=post action='/aiscan/{st['id']}'><button>Scan for AI writing</button> "
+                     "<span class=mut>Signals only, never proof.</span></form>")
     elif st.get("mode") == "scan":
         return page("Not found", "<p>Not found. <a href='/'>Home</a></p>")
+    h = st.get("handin")
+    if h:
+        c = all_classes().get(h["classroom"], {})
+        a = assignment(h["classroom"], h.get("assignment")) if h.get("assignment") else None
+        head += (f"<div class='card handed'><span class=stamp>Handed in</span>{'<span class="stamp late">Late</span>' if h.get('late') else ''}"
+                 f"<p>{e(h['student'])} handed this in to <b>{e(c.get('name', h['classroom']))}</b>"
+                 f"{' for <b>' + e(a['title']) + '</b>' if a else ''} on {time.strftime('%Y-%m-%d at %H:%M', time.localtime(h['at']))}"
+                 f"{' (handed in by a teacher)' if h.get('by_teacher') else ''}. It can't be changed or handed in again.</p>"
+                 + (f"<form method=post action='/handback/{st['id']}' onsubmit=\"return confirm('Hand this back? The student will be able to hand in again.')\">"
+                    "<button class=link>Hand it back (let them hand in again)</button></form>"
+                    if teacher and h["classroom"] in classes_for(teacher) else "") + "</div>")
+    elif is_student(st) and st.get("owner") == viewer and st["status"] == "done" and not teacher:
+        head += HANDIN_FORM.replace("{ID}", st["id"]).replace("{TITLE}", e(st["title"]))
     award = st.get("hint_award")
     if award and st.get("owner") == viewer:
-        head += (f"<div class='card add'><b class=hand>{'Nice work!' if award['earned'] else 'Marked.'}</b> You scored {award['score']}%"
+        head += (f"<div class='card add'><b class=hand>{'Nice work!' if award['earned'] else 'Handed in.'}</b> You scored {award['score']}%"
                  + (" and earned a hint! Open the Cheat Sheet to see your hints." if award["earned"]
                     else f". Score {award.get('needed', settings()['hint_score'])}% or more to earn a hint." if "needed" in award
                     else ", but your hint wallet was already full.") + "</div>")
@@ -1448,7 +1626,7 @@ Citation numbers become a source list at the end.</p><p><button onclick=build()>
         bar = "<div id=hintbar class='show nohints' role=region aria-label='Hints'><span>Hints unlock when marking is finished.</span></div>"
     else:
         bar = ""
-    return page(st["title"], head + body + tail + logs + bar + ("" if student else TEACHER_SCRIPT), refresh=running or hinting,
+    return page(st["title"], head + body + tail + logs + bar + ("" if student else TEACHER_SCRIPT), refresh=running or hinting or bool(st.get("ai_pending")),
                 side=drawers(teacher, viewer))
 
 
@@ -1492,10 +1670,15 @@ class H(BaseHTTPRequestHandler):
         p = self.path.split("?")[0]
         if p == "/":
             return self.send(200, home(vid, teacher))
-        m = re.match(r"^/class/([A-Z]{3}-[A-Z0-9]{4})(?:/s/(.+))?$", p)
+        if p == "/classinfo":
+            info = class_info(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("w", [""])[0])
+            return self.send(200, json.dumps(info or {"error": "No class uses that word. Check the spelling with your teacher."}),
+                             "application/json")
+        m = re.match(r"^/class/([A-Z0-9-]{4,12})(?:/(s|a)/(.+))?$", p)
         if m and teacher:
-            out = (student_page(m.group(1), urllib.parse.unquote(m.group(2)), teacher, vid) if m.group(2)
-                   else class_page(m.group(1), teacher, vid))
+            code, kind, arg = m.group(1), m.group(2), urllib.parse.unquote(m.group(3) or "")
+            out = (student_page(code, arg, teacher, vid) if kind == "s" else assignment_page(code, arg, teacher, vid)
+                   if kind == "a" else class_page(code, teacher, vid))
             if out:
                 return self.send(200, out)
         m = re.match(r"^/job/([0-9a-f]+)(\.json)?$", p)
@@ -1522,6 +1705,36 @@ class H(BaseHTTPRequestHandler):
             except ValueError as ex:
                 out = {"error": str(ex)}
             return self.send(200, json.dumps(out), "application/json")
+        m = re.match(r"^/aiscan/([0-9a-f]+)$", self.path)
+        if m and teacher:
+            st = self.job(m.group(1), teacher)
+            if st and st["status"] == "done" and not st.get("ai") and not st.get("ai_pending"):
+                with file_lock:
+                    st = load(st["id"]); st["ai_pending"] = True; save(st)
+                threading.Thread(target=scan_later, args=(st["id"],), daemon=True).start()
+            return self.send(303, "", loc=f"/job/{m.group(1)}")
+        m = re.match(r"^/handin/([0-9a-f]+)$", self.path)
+        if m:
+            st = self.job(m.group(1), teacher)
+            if not st or not is_student(st) or st.get("owner") != vid or st["status"] != "done":
+                return self.send(404, "not found")
+            if f("sure") != "1":
+                return self.send(400, page("Hand in", "<p>Tick the box to say you're ready. <a href='javascript:history.back()'>Back</a></p>"))
+            err = hand_in(st["id"], re.sub(r"[^A-Z0-9-]", "", f("classword").upper())[:12], f("assignment"), f("student"))
+            if err:
+                return self.send(400, page("Hand in", f"<div class='card add'><b class=hand>Not handed in:</b> {e(err)}</div>"
+                                           f"<p><a href='/job/{st['id']}'>← Back to your paper</a></p>"))
+            return self.send(303, "", loc=f"/job/{st['id']}")
+        m = re.match(r"^/handback/([0-9a-f]+)$", self.path)
+        if m and teacher:
+            st = self.job(m.group(1), teacher)
+            if st and st.get("handin") and st["handin"]["classroom"] in classes_for(teacher):
+                hand_back(st["id"])
+            return self.send(303, "", loc=f"/job/{m.group(1)}")
+        m = re.match(r"^/class/([A-Z0-9-]{4,12})/assign$", self.path)
+        if m and teacher:
+            add_assignment(teacher, m.group(1), f("title"), f("due"))
+            return self.send(303, "", loc=f"/class/{m.group(1)}")
         if self.path == "/teacher/class" and teacher:
             code = create_class(teacher, f("name"))
             return self.send(303, "", loc=f"/class/{code}")
@@ -1579,8 +1792,10 @@ class H(BaseHTTPRequestHandler):
             if not text and not images:
                 return self.send(400, home(vid, teacher, "Paste your draft or pick a file first."))
             task = f("task") if teacher else "mark"
-            mode = {"mark": "student", "markscan": "student", "scan": "scan", "teacher": "teacher"}.get(task, "student")
-            classroom = f("classroom") if teacher and f("classroom") in classes_for(teacher) else ""
+            mode = {"mark": "student", "markscan": "student", "scan": "scan", "author": "author"}.get(task, "student")
+            classroom, aid = (f("target").split("|", 1) + [""])[:2] if teacher and "|" in f("target") else ("", "")
+            if classroom not in classes_for(teacher or ""):
+                classroom, aid = "", ""
             student = " ".join(f("student").split())[:80] if classroom else ""
             if classroom and not student:
                 return self.send(400, home(vid, teacher, "Type the student's name or number when you pick a class."))
@@ -1596,8 +1811,11 @@ class H(BaseHTTPRequestHandler):
                   "extra": extra, "status": "queued", "step": "sections", "mode": mode, "owner": vid, "aiscan": task == "markscan"}
             if teacher:
                 st["by_teacher"] = teacher
-            if classroom:
+            if classroom:   # a teacher handing in a student's paper: it counts as handed in right away
                 st.update(classroom=classroom, student=student, student_key=student_key(student))
+                st["handin"] = {"classroom": classroom, "assignment": aid, "student": student, "at": time.time(),
+                                "late": is_late(assignment(classroom, aid), time.time()) if aid else False,
+                                "hints_used": 0, "by_teacher": teacher}
             if images:
                 st["ocr_files"], st["typed"], st["step"] = [], text, "ocr"
                 for i, img in enumerate(images[:MAX_PAGES], 1):
