@@ -13,7 +13,7 @@ Pipeline per job (each step is saved to state.json, so a restart resumes where i
   sections -> claims -> research (SearXNG + page fetch) -> verdicts -> topic ideas -> tips -> done
 The student's text is never rewritten.
 """
-import base64, email.parser, email.policy, hashlib, hmac, html, io, json, os, re, secrets, subprocess, sys, tempfile, threading, time
+import base64, email.parser, email.policy, hashlib, hmac, html, io, json, math, os, re, secrets, subprocess, sys, tempfile, threading, time
 import traceback, urllib.parse, urllib.request, zipfile
 from http.cookies import SimpleCookie
 from html.parser import HTMLParser
@@ -491,7 +491,7 @@ def write_json(path, obj):
     os.replace(path + ".tmp", path)
 
 def settings():
-    cfg = {"hint_score": 80, "start_hints": 1}
+    cfg = {"hint_score": 80, "start_hints": 1, "ocr_review_pct": 10}
     cfg.update(read_json(SETTINGS_FILE, {}))
     return cfg
 
@@ -557,8 +557,13 @@ def make_hint(jid, hid):
 
 
 # ---------- uploads: Word, PDF, text files, and photos/scans read by a local vision model ----------
+# OCR_ENGINE "ollama": any vision model through Ollama (OCR_MODEL). "unlimited": Unlimited-OCR-2 on a llama.cpp server
+# (OpenAI-style /v1/chat/completions), several times faster on a CPU and it reports how sure it is of each word, so pages
+# with many unsure words get flagged for a human check. See the README for setting it up.
+OCR_ENGINE = os.environ.get("OCR_ENGINE", "ollama")
 OCR_MODEL = os.environ.get("OCR_MODEL", "qwen3-vl:4b-instruct")
-OCR_URL = os.environ.get("OCR_URL", LLM_URL)
+OCR_URL = os.environ.get("OCR_URL", "http://127.0.0.1:8092/v1/chat/completions" if OCR_ENGINE == "unlimited" else LLM_URL)
+OCR_UNSURE = float(os.environ.get("OCR_UNSURE", "0.75"))  # a word read with less confidence than this counts as unsure
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
 MAX_UPLOAD = 20 * 1024 * 1024
 MAX_PAGES = 10
@@ -640,25 +645,113 @@ def shrink(img):
         return img
 
 def ocr_image(img):
+    """-> {"text": ...} and, with the unlimited engine, also words / unsure / unsure_words / loop for the review flag."""
+    if OCR_ENGINE == "unlimited":
+        return ocr_unlimited(img)
     body = {"model": OCR_MODEL, "stream": False, "think": False, "options": {"temperature": 0, "num_predict": 3000},
             "messages": [{"role": "user", "content": OCR_PROMPT, "images": [base64.b64encode(shrink(img)).decode()]}]}
     if THREADS:
         body["options"]["num_thread"] = THREADS
     req = urllib.request.Request(OCR_URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=3600) as r:
-        return json.load(r)["message"]["content"].strip()
+        return {"text": json.load(r)["message"]["content"].strip()}
+
+OCR_MARKUP = re.compile(r"<[^>]*>|\b[a-z_]+\[[\d,\s]*\]")   # <PAGE>, <BLOCK>text[x1, y1, x2, y2]<FORK>, table tags
+OCR_WORD = re.compile(r"[^\W\d_](?:[\w'’-]*\w)?")
+
+def ocr_unlimited(img):
+    body = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + base64.b64encode(shrink(img)).decode()}}]}],
+            "temperature": 0, "max_tokens": 4000, "logprobs": True, "top_logprobs": 1}
+    req = urllib.request.Request(OCR_URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=3600) as r:
+        choice = json.load(r)["choices"][0]
+    raw, toks = choice["message"]["content"], (choice.get("logprobs") or {}).get("content") or []
+    # how sure the model was of each word: the least sure token in it (markup like block boxes is skipped)
+    spans, pos = [], 0
+    for t in toks:
+        spans.append((pos, pos + len(t["token"]), math.exp(t.get("logprob", 0))))
+        pos += len(t["token"])
+    if pos != len(raw):
+        spans = []
+    markup = [(m.start(), m.end()) for m in OCR_MARKUP.finditer(raw)]
+    words, unsure = 0, []
+    for m in OCR_WORD.finditer(raw):
+        if any(a <= m.start() < b for a, b in markup):
+            continue
+        words += 1
+        conf = min((p for a, b, p in spans if a < m.end() and b > m.start()), default=1.0)
+        if conf < OCR_UNSURE:
+            unsure.append(m.group())
+    text = re.sub(r"<BLOCK>[a-z_]*\[[\d,\s]*\]<FORK>", "\n", raw)
+    text = re.sub(r"</tr>|<br\s*/?>", "\n", text)
+    text = re.sub(r"</t[dh]>", "  ", text)
+    text = re.sub(r"[ \t]+\n", "\n", OCR_MARKUP.sub("", text)).strip()
+    text, looped = cut_loop(text)
+    return {"text": text, "words": words, "unsure": len(unsure), "unsure_words": list(dict.fromkeys(unsure))[:40],
+            "loop": looped or choice.get("finish_reason") == "length"}
+
+def cut_loop(text, n=6, times=3):
+    """The model sometimes gets stuck repeating a sentence. If any n words come round `times` times, keep the text up to
+    where they first came back. -> (text, cut?)"""
+    toks = list(re.finditer(r"\S+", text))
+    seen = {}
+    for i in range(len(toks) - n + 1):
+        key = tuple(t.group().lower() for t in toks[i:i + n])
+        seen.setdefault(key, []).append(i)
+        if len(seen[key]) >= times:
+            return text[:toks[seen[key][1]].start()].rstrip(), True
+    return text, False
+
+def ocr_flagged(rec):
+    """Should a person check how this page was read?"""
+    if rec.get("loop"):
+        return True
+    w = rec.get("words", 0)
+    return w >= 20 and 100 * rec.get("unsure", 0) / w >= settings()["ocr_review_pct"]
 
 def step_ocr(st):
     files, pages = st.get("ocr_files", []), st.setdefault("ocr_pages", {})
+    check = st.setdefault("ocr_check", {})
     for n, name in enumerate(files, 1):
         if name not in pages:
             with open(jpath(st["id"], name), "rb") as f:
-                pages[name] = ocr_image(f.read())
-            log(st, f"read page {n} of {len(files)} from the photo/scan")
+                rec = ocr_image(f.read())
+            pages[name] = rec.pop("text")
+            if rec:
+                check[name] = rec
+                log(st, f"read page {n} of {len(files)} from the photo/scan ({rec['unsure']} of {rec['words']} words unsure"
+                        f"{', repeated itself so the end was cut' if rec['loop'] else ''})")
+            else:
+                log(st, f"read page {n} of {len(files)} from the photo/scan")
+    st["ocr_review"] = [n for n, name in enumerate(files, 1) if name in check and ocr_flagged(check[name])]
     text = "\n\n".join(pages[n] for n in files).strip()
     if not text:
         raise ValueError("No writing could be read from the photo or scan.")
     st["text"] = ((st.get("typed") or "") + "\n\n" + text).strip()[:60000]
+
+def ocr_card(st):
+    """What the reader made of a photo or scan, with the pages and words to check by hand."""
+    files, check = st.get("ocr_files", []), st.get("ocr_check", {})
+    if not check:
+        return "<p class=mut>This paper was read from a photo or scan. If something looks wrong, it may be a reading mistake.</p>"
+    words, unsure = sum(c.get("words", 0) for c in check.values()), sum(c.get("unsure", 0) for c in check.values())
+    flagged = st.get("ocr_review") or []
+    if not flagged:
+        return (f"<p class=mut>Read from a photo or scan ({len(files)} page{'s' if len(files) > 1 else ''}, {words} words). "
+                f"The reader was unsure of {unsure} word{'' if unsure == 1 else 's'}; if something looks wrong, it may be a reading mistake.</p>")
+    rows = ""
+    for n, name in enumerate(files, 1):
+        c = check.get(name)
+        if not c or n not in flagged:
+            continue
+        rows += (f"<p><b>Page {n}</b>: unsure of {c['unsure']} of {c['words']} words"
+                 f" ({round(100 * c['unsure'] / max(1, c['words']))}%)"
+                 + (". The reader got stuck repeating itself, so the end of this page may be missing" if c.get("loop") else "") + "."
+                 + ("<br><span class=mut>Words to check:</span> " + " ".join(f"<span class='v unclear'>{e(w)}</span>" for w in c["unsure_words"])
+                    if c.get("unsure_words") else "") + "</p>")
+    return ("<div class='card ocrcheck'><b>Check the reading</b> <span class=mut>Part of this photo or scan was hard to read, so the text "
+            "below may have reading mistakes that are not the student's.</span>" + rows + "</div>")
 
 def parse_body(handler):
     """-> (fields, files) for url-encoded or multipart forms; files = {name: (filename, bytes)}."""
@@ -805,6 +898,9 @@ def step_aiscan(st):
 
 AI_LEVEL = {"low": ("supported", "Few signs of AI writing"), "some": ("partly", "Some signs of AI writing"),
             "strong": ("contradicted", "Strong signs of AI writing")}
+
+def read_badge(st):
+    return " <span class='v unclear' title='Part of the photo or scan was hard to read'>check reading</span>" if st.get("ocr_review") else ""
 
 def ai_card(st):
     a = st.get("ai")
@@ -1120,7 +1216,7 @@ def assignment_view(code, aid, teacher, viewer):
             label, cls = work_status(a, j)
             h = j["handin"] if j else {}
             rows += (f"<tr><td>{e(v['name'])}</td><td><span class='v {cls}'>{label}</span></td>"
-                     f"<td>{('<a href=/job/%s>%s</a>' % (j['id'], e(j['title']))) if j else '–'}</td>"
+                     f"<td>{('<a href=/job/%s>%s</a>' % (j['id'], e(j['title'])) + read_badge(j)) if j else '–'}</td>"
                      f"<td class=mut>{time.strftime('%b %d %H:%M', time.localtime(h['at'])) if j else ''}</td>"
                      f"<td>{(str(score(j)) + '%') if j and score(j) is not None else ''}</td><td>{h.get('hints_used') or ''}</td>"
                      + ("<td><span class='v %s'>%s</span></td>" % (AI_LEVEL[j['ai']['level']][0], j['ai']['level']) if j and j.get('ai') else "<td></td>")
@@ -1167,7 +1263,7 @@ def student_profile(code, key, teacher, viewer):
         a, h = asg.get(j["handin"].get("assignment")), j["handin"]
         s = text_stats(j["text"]) if j.get("text") else {}
         ai = (j.get("ai") or {}).get("level")
-        rows += (f"<tr><td class=mut>{time.strftime('%Y-%m-%d', time.localtime(h['at']))}</td><td><a href='/job/{j['id']}'>{e(j['title'])}</a></td>"
+        rows += (f"<tr><td class=mut>{time.strftime('%Y-%m-%d', time.localtime(h['at']))}</td><td><a href='/job/{j['id']}'>{e(j['title'])}</a>{read_badge(j)}</td>"
                  f"<td>{e(a['title']) if a else 'other work'}</td>"
                  f"<td>{(str(h['grade']) + '/' + str(a.get('points', 100))) if a and h.get('grade') is not None else ('late' if h.get('late') else '–')}</td>"
                  f"<td>{(str(score(j)) + '%') if score(j) is not None else '–'}</td><td>{s.get('words', '–')}</td><td>{s.get('grade', '–')}</td>"
@@ -1373,7 +1469,7 @@ label.upload{display:block;margin:.2em 0}
 label.sure input{width:auto;margin-top:5px}
 .stamp{display:inline-block;font:700 1.1rem var(--hand);color:var(--pen);border:3px double var(--pen);padding:.1em .6em;
  transform:rotate(-6deg);text-transform:uppercase;letter-spacing:.08em;margin:.2em .6em .4em 0}.stamp.late{color:var(--half);border-color:var(--half)}label.upload input{margin-top:6px;background:transparent;border-style:dashed}
-.aiscan{border-left:4px solid var(--half)}.aiscan summary .v{margin-left:.6em}
+.aiscan{border-left:4px solid var(--half)}.ocrcheck{border-left:4px solid var(--q)}.aiscan summary .v{margin-left:.6em}
 .star{color:var(--pencil-edge);font-size:1.2rem;letter-spacing:.1em}.star.off{color:var(--line)}
 .hintbox{background:var(--paper)}.hintbox p{margin:.3em 0}
 #hintbar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:40;display:none;max-width:92vw;
@@ -1564,7 +1660,9 @@ def teacher_panel(teacher, viewer, open_it=False, msg=""):
                 f"<h3>Student hints</h3><form method=post action=/teacher/settings class=card>"
                 f"<label class=mut>Score needed to earn a hint (%)<input name=hint_score type=number min=0 max=100 value={settings()['hint_score']}></label>"
                 f"<label class=mut>Hints a new student starts with (0-{MAX_HINTS})<input name=start_hints type=number min=0 max={MAX_HINTS} value={settings()['start_hints']}></label>"
-                "<p><button>Save</button></p></form>"
+                + (f"<label class=mut>Flag a photo or scan for a reading check when this share of its words was hard to read (%)"
+                   f"<input name=ocr_review_pct type=number min=1 max=100 value={settings()['ocr_review_pct']}></label>" if OCR_ENGINE == "unlimited" else "")
+                + "<p><button>Save</button></p></form>"
                 "<h3>How teacher mode works</h3><ul class=mut><li>Pick what to do in the form: mark it, mark it and scan for "
                 "AI writing, or scan only. Pick a class and type the student's name or number to build their profile.</li>"
                 "<li><b>Author mode</b> is for your own writing: it fact-checks your article and drafts sourced additions "
@@ -1608,7 +1706,7 @@ document.getElementById('handin').addEventListener('submit',ev=>{if(!ta.value.tr
 f.addEventListener('change',async()=>{if(!f.files.length)return;note.textContent='Reading the file…';const fd=new FormData();fd.append('file',f.files[0]);
  try{const r=await(await fetch('/extract',{method:'POST',body:fd})).json();
   if(r.error){note.textContent=r.error;f.value=''}
-  else if(r.ocr){note.textContent='This is a photo or scan ('+r.pages+' page'+(r.pages>1?'s':'')+'). It will be read when marking starts (about a minute a page), and the report will say so. Check the text there for reading mistakes.'}
+  else if(r.ocr){note.textContent='This is a photo or scan ('+r.pages+' page'+(r.pages>1?'s':'')+'). It will be read when marking starts (usually under a minute a page), and the report will say so. Check the text there for reading mistakes.'}
   else{ta.value=r.text;f.value='';note.textContent='Text taken from the file. Have a quick look, then hand it in.';if(!document.querySelector('#handin input[name=title]').value)document.querySelector('#handin input[name=title]').value=r.title||''}}
  catch(e){note.textContent='Could not read the file here; it will be read when you hand it in.'}})})();
 </script>"""
@@ -1744,7 +1842,7 @@ def report(st, viewer=None, teacher=None):
         head += (f"<p class=mut>Class <a href='/class/{st['classroom']}'>{e(c.get('name', st['classroom']))}</a> · student "
                  f"<a href='/class/{st['classroom']}/s/{urllib.parse.quote(st.get('student_key', ''))}'>{e(st.get('student'))}</a></p>")
     if st.get("ocr_files") and st["status"] == "done":
-        head += "<p class=mut>This paper was read from a photo or scan. If something looks wrong, it may be a reading mistake.</p>"
+        head += ocr_card(st)
     if teacher:
         head += ai_card(st)
         if st.get("ai_pending"):
@@ -2077,6 +2175,7 @@ class H(BaseHTTPRequestHandler):
             try:
                 cfg["hint_score"] = max(0, min(100, int(f("hint_score", cfg["hint_score"]))))
                 cfg["start_hints"] = max(0, min(MAX_HINTS, int(f("start_hints", cfg["start_hints"]))))
+                cfg["ocr_review_pct"] = max(1, min(100, int(f("ocr_review_pct", cfg["ocr_review_pct"]))))
             except ValueError:
                 pass
             write_json(SETTINGS_FILE, cfg)

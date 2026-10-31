@@ -82,9 +82,31 @@ tick-box suggestions, then **Write out the clean copy** assembles the draft, the
 ## Uploads and photos
 The hand-in form takes a Word file (.docx), a PDF, a text file, or a photo or scan of handwritten work. Text from
 Word, text and PDF files goes straight into the box to check before handing in. Photos and scanned PDFs are read by a
-local vision model (`OCR_MODEL`, default `qwen3-vl:4b-instruct` via Ollama) as the first step of marking, about a
-minute a page on a CPU, and the report notes that it was read from a photo. PDFs need `pdftotext`/`pdftoppm`
-(poppler-utils); Pillow (`python3-pil`) is optional and makes big phone photos much faster to read.
+local vision model as the first step of marking, and the report notes that it was read from a photo. PDFs need
+`pdftotext`/`pdftoppm` (poppler-utils); Pillow (`python3-pil`) is optional and makes big phone photos much faster to read.
+
+Two reading engines (`OCR_ENGINE`):
+- **`ollama`** (default): any Ollama vision model (`OCR_MODEL`, default `qwen3-vl:4b-instruct`). Nothing extra to
+  set up; about a minute a page on a CPU.
+- **`unlimited`** (faster, recommended): [Unlimited-OCR-2](https://huggingface.co/baidu/Unlimited-OCR-2) on a
+  llama.cpp server. In our CPU tests it read handwriting 1.5-3x faster than `qwen3-vl:4b` with about the same accuracy,
+  and loads in seconds. It also reports how sure it is of every word, so pages where many words were hard to read get a
+  **Check the reading** card listing those words, and a *check reading* badge in the teacher's tables. The share of
+  unsure words that triggers it is a teacher setting (default 10%); a page where the reader got stuck repeating itself
+  is always flagged and the repeat is cut off. Pages are read one at a time (sending several pages in one request made
+  it loop in our tests).
+
+  Ollama and mainline llama.cpp can't load Unlimited-OCR-2 yet. Until they can, build llama.cpp with the community patch
+  from [cicaba/Unlimited-OCR-2-GGUF](https://huggingface.co/cicaba/Unlimited-OCR-2-GGUF) (read the patch first; it
+  targets llama.cpp commit `3c809f443`):
+  ```
+  git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && git checkout 3c809f443
+  git apply unlimited-ocr2.patch     # llama.cpp-patch/unlimited-ocr2.patch from that repo
+  cmake -B build -DBUILD_SHARED_LIBS=OFF && cmake --build build -j --target llama-server
+  ./build/bin/llama-server -m Unlimited-OCR-2-Q4_K_M.gguf --mmproj mmproj-Unlimited-OCR-2-F16.gguf \
+      --jinja -np 1 -c 16384 -t 12 --temp 0 --host 127.0.0.1 --port 8092
+  ```
+  then start Homework Wizard with `OCR_ENGINE=unlimited`. The server needs about 7 GB of RAM.
 
 ## Requirements
 - Python 3.12+ (standard library only, nothing to `pip install`)
@@ -115,8 +137,10 @@ Settings (environment variables):
 | `TEACHERS_FILE` | `teachers.json` next to `DATA_DIR` | teacher logins (hashed passwords) |
 | `SECRET_FILE` | `secret.key` next to `DATA_DIR` | signs teacher logins (created automatically) |
 | `CLIENT_IP_HEADER` | none | header holding the visitor's real address, set by your proxy, e.g. `CF-Connecting-IP` (Cloudflare) or `X-Real-IP` (nginx with `proxy_set_header X-Real-IP $remote_addr`). Only set it if every request goes through that proxy, since visitors could fake it otherwise |
-| `OCR_MODEL` | `qwen3-vl:4b-instruct` | Ollama vision model that reads photos and scans |
-| `OCR_URL` | same as `LLM_URL` | Ollama endpoint for the vision model |
+| `OCR_ENGINE` | `ollama` | `ollama` or `unlimited` (see Uploads and photos) |
+| `OCR_MODEL` | `qwen3-vl:4b-instruct` | Ollama vision model that reads photos and scans (`ollama` engine) |
+| `OCR_URL` | `LLM_URL`, or `http://127.0.0.1:8092/v1/chat/completions` for `unlimited` | where the reading engine listens |
+| `OCR_UNSURE` | `0.75` | `unlimited` engine: a word read with less confidence than this counts as unsure |
 | `PORT` | `8501` | web port |
 | `THREADS` | Ollama's choice | CPU threads for the model (on CPU-only setups, roughly your physical core count) |
 
